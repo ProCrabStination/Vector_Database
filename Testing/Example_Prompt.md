@@ -1,0 +1,2 @@
+{"prompt":"What circuit breakers are available for use in a 10k rated panel? Conduit adapters?",
+"setup":"You are an Electrical Engineering expert assistant AI, please follow the request from engineering and return the best answer possible given the references extracted for you. If you need more information extracted, please put in brackets  the information that you want to extract from the database for more context.","Chat History":""}

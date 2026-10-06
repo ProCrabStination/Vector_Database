@@ -1,0 +1,431 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Vector Database Search</title>
+<style>
+  :root {
+    --bg: #0f172a; --panel: #1e293b; --border: #334155; --text: #e2e8f0;
+    --muted: #94a3b8; --accent: #3b82f6; --accent-hover: #2563eb; --score: #22c55e;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    background: var(--bg); color: var(--text);
+  }
+  header {
+    padding: 1rem 1.5rem; border-bottom: 1px solid var(--border);
+    display: flex; align-items: baseline; gap: 0.75rem;
+  }
+  header h1 { font-size: 1.15rem; margin: 0; }
+  header .store { color: var(--muted); font-size: 0.8rem; }
+  .layout { display: flex; gap: 1.5rem; padding: 1.5rem; align-items: flex-start; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 1.25rem;
+  }
+  .search-panel { width: 340px; flex-shrink: 0; position: sticky; top: 1.5rem; }
+  .results-panel { flex: 1; min-width: 0; }
+  label { display: block; font-size: 0.8rem; color: var(--muted); margin: 0.9rem 0 0.3rem; }
+  label:first-child { margin-top: 0; }
+  textarea, input[type=text], input[type=number], select {
+    width: 100%; background: #0f172a; color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 0.5rem; font-size: 0.9rem; font-family: inherit;
+  }
+  textarea { resize: vertical; min-height: 5rem; }
+  select[multiple] option { padding: 0.25rem 0.4rem; }
+  select[multiple] option:checked { background: var(--accent); color: white; }
+  .row { display: flex; gap: 0.75rem; }
+  .row > div { flex: 1; }
+  .checkbox-row { display: flex; align-items: center; gap: 0.4rem; margin-top: 0.9rem; }
+  .checkbox-row label { margin: 0; color: var(--text); font-size: 0.85rem; }
+  button {
+    margin-top: 1.2rem; width: 100%; background: var(--accent); color: white; border: none;
+    border-radius: 6px; padding: 0.65rem; font-size: 0.95rem; cursor: pointer; font-weight: 600;
+  }
+  button:hover { background: var(--accent-hover); }
+  button:disabled { background: #475569; cursor: default; }
+  .btn-secondary { background: #4c1d95; }
+  .btn-secondary:hover { background: #5b21b6; }
+  .status { color: var(--muted); font-size: 0.85rem; margin-top: 0.6rem; min-height: 1.1rem; }
+  .suggestion-note {
+    display: none; background: #2e1065; border: 1px solid #6d28d9; border-radius: 6px;
+    padding: 0.6rem 0.75rem; font-size: 0.8rem; margin-top: 0.7rem; line-height: 1.4;
+  }
+  .btn-tertiary {
+    margin-top: 0; width: auto; display: inline-block; background: #164e63;
+    padding: 0.5rem 0.9rem; font-size: 0.85rem;
+  }
+  .btn-tertiary:hover { background: #155e75; }
+  .results-toolbar { margin-bottom: 1rem; }
+  .ref-summary {
+    display: none; background: #082f49; border: 1px solid #0369a1; border-radius: 8px;
+    padding: 0.9rem 1.1rem; margin-top: 0.75rem; font-size: 0.88rem; line-height: 1.5;
+    white-space: pre-wrap;
+  }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 1rem 1.25rem; margin-bottom: 1rem;
+  }
+  .card-top { display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; }
+  .card-top .score { color: var(--score); font-weight: 700; font-size: 0.95rem; white-space: nowrap; }
+  .doc-path { color: var(--accent); font-size: 0.8rem; word-break: break-all; margin-top: 0.15rem; }
+  .headings { color: var(--muted); font-size: 0.78rem; margin-top: 0.35rem; }
+  .snippet {
+    white-space: pre-wrap; font-size: 0.88rem; line-height: 1.45; margin-top: 0.6rem;
+    max-height: 9rem; overflow-y: auto; border-top: 1px solid var(--border); padding-top: 0.6rem;
+  }
+  .snippet.expanded { max-height: none; }
+  .expand-btn {
+    background: none; border: none; color: var(--accent); font-size: 0.78rem; padding: 0;
+    width: auto; margin-top: 0.4rem; cursor: pointer; text-align: left;
+  }
+  .table-block { margin-top: 0.7rem; }
+  .table-caption { color: var(--muted); font-size: 0.75rem; margin-bottom: 0.3rem; }
+  .table-scroll { overflow-x: auto; border: 1px solid var(--border); border-radius: 6px; }
+  table.data-table { border-collapse: collapse; width: 100%; font-size: 0.82rem; }
+  table.data-table th, table.data-table td {
+    border: 1px solid var(--border); padding: 0.35rem 0.55rem; text-align: left; white-space: nowrap;
+  }
+  table.data-table thead tr { background: #0b1220; }
+  table.data-table tbody tr:nth-child(even) td { background: rgba(255, 255, 255, 0.03); }
+  .pictures { display: flex; gap: 0.5rem; margin-top: 0.6rem; flex-wrap: wrap; }
+  .pictures img {
+    max-height: 90px; border-radius: 4px; border: 1px solid var(--border); cursor: zoom-in;
+  }
+  #lightbox {
+    position: fixed; inset: 0; z-index: 1000; display: none; align-items: center; justify-content: center;
+    background: rgba(0, 0, 0, 0.92); cursor: zoom-out;
+  }
+  #lightbox.open { display: flex; }
+  #lightbox img { width: 100vw; height: 100vh; object-fit: contain; }
+  .open-doc-btn {
+    display: inline-block; margin-left: 0.75rem; color: var(--accent); font-size: 0.78rem; text-decoration: none;
+    border: 1px solid var(--border); border-radius: 4px; padding: 0.1rem 0.5rem;
+  }
+  .open-doc-btn:hover { text-decoration: underline; }
+  .empty { color: var(--muted); font-style: italic; }
+  .meta-line { color: var(--muted); font-size: 0.75rem; margin-top: 0.35rem; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Vector Database Search</h1>
+  <span class="store">{{ store_dir }}</span>
+</header>
+
+<div class="layout">
+  <div class="panel search-panel">
+    <label for="query">Query (one per line = multiple queries)</label>
+    <textarea id="query" placeholder="e.g. Class I Division 1 conduit seal requirements"></textarea>
+
+    <div class="row">
+      <div>
+        <label for="topPerQuery">Top-K per query</label>
+        <input type="number" id="topPerQuery" value="5" min="1" max="50">
+      </div>
+      <div>
+        <label for="topOverall">Top-K overall</label>
+        <input type="number" id="topOverall" value="20" min="1" max="100">
+      </div>
+    </div>
+
+    <label for="keywords">Keywords (comma separated, optional)</label>
+    <input type="text" id="keywords" placeholder="e.g. class 1, division 1, seal">
+
+    <label for="docFilter">Filter by document (optional, ctrl/cmd-click for multiple)</label>
+    <select id="docFilter" multiple size="6"></select>
+    <button type="button" id="clearDocFilter" class="btn-tertiary" style="margin-top: 0.4rem;">Clear document filter</button>
+
+    <div class="checkbox-row">
+      <input type="checkbox" id="useKeywords" checked>
+      <label for="useKeywords">Use keyword-boosted search (search_vectors_keywords)</label>
+    </div>
+    <div class="checkbox-row">
+      <input type="checkbox" id="dedupe" checked>
+      <label for="dedupe">De-duplicate per query</label>
+    </div>
+
+    <button id="searchBtn">Search</button>
+    <button id="suggestBtn" class="btn-secondary">✨ Search with AI suggested prompt</button>
+    <div class="status" id="status"></div>
+    <div class="suggestion-note" id="suggestionNote"></div>
+  </div>
+
+  <div class="results-panel">
+    <div class="results-toolbar">
+      <button id="summarizeBtn" class="btn-tertiary" disabled>🧭 Summarize the most important references</button>
+      <div class="ref-summary" id="refSummary"></div>
+    </div>
+    <div id="results">
+      <div class="empty">Results will appear here.</div>
+    </div>
+  </div>
+</div>
+
+<div id="lightbox"><img alt=""></div>
+<script>
+const $ = (id) => document.getElementById(id);
+
+let lastResults = [];
+
+function selectedDocNames() {
+  return Array.from($("docFilter").selectedOptions).map(opt => opt.value);
+}
+
+function currentSearchBody() {
+  return {
+    query: $("query").value,
+    top_k_per_query: parseInt($("topPerQuery").value, 10) || 5,
+    top_k_overall: parseInt($("topOverall").value, 10) || 20,
+    dedupe: $("dedupe").checked,
+    use_keywords: $("useKeywords").checked,
+    keywords: $("keywords").value,
+    doc_names: selectedDocNames(),
+  };
+}
+
+async function loadDocumentList() {
+  try {
+    const resp = await fetch("/api/documents");
+    const docs = await resp.json();
+    const select = $("docFilter");
+    select.innerHTML = "";
+    docs.forEach(d => {
+      const opt = document.createElement("option");
+      opt.value = d.name;
+      opt.textContent = `${d.name} (${d.chunk_count})`;
+      select.appendChild(opt);
+    });
+  } catch (err) {
+    console.error("Failed to load document list:", err);
+  }
+}
+
+async function runSearch() {
+  const query = $("query").value;
+  if (!query.trim()) { $("status").textContent = "Enter a query first."; return; }
+
+  const btn = $("searchBtn");
+  btn.disabled = true;
+  $("status").textContent = "Searching… (embedding via Ollama, may take a few seconds)";
+  $("results").innerHTML = "";
+
+  try {
+    const resp = await fetch("/api/search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(currentSearchBody()),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      $("status").textContent = "Error: " + (data.error || resp.statusText);
+      return;
+    }
+    renderResults(data);
+    lastResults = data.overall_top_k || [];
+    $("summarizeBtn").disabled = lastResults.length === 0;
+    $("refSummary").style.display = "none";
+    $("status").textContent = `${data.overall_top_k.length} result(s) across ${data.query_count} quer${data.query_count === 1 ? "y" : "ies"}.`;
+  } catch (err) {
+    $("status").textContent = "Request failed: " + err;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function summarizeReferences() {
+  if (!lastResults.length) { $("status").textContent = "Run a search first."; return; }
+
+  const question = $("query").value.trim() || "the current search";
+  const btn = $("summarizeBtn");
+  btn.disabled = true;
+  const box = $("refSummary");
+  box.style.display = "block";
+  box.textContent = "Asking the local LLM to review the results…";
+
+  const trimmedResults = lastResults.map(r => ({
+    doc_name: r.doc_name,
+    headings: (r.metadata && r.metadata.headings) || [],
+    chunk_index: r.metadata ? r.metadata.chunk_index : null,
+    score: r.final_score ?? r.score ?? null,
+    text: r.text || "",
+  }));
+
+  try {
+    const resp = await fetch("/api/summarize_references", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question, results: trimmedResults }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      box.textContent = "Error: " + (data.error || resp.statusText);
+      return;
+    }
+    box.textContent = data.summary;
+  } catch (err) {
+    box.textContent = "Request failed: " + err;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function suggestAndSearch() {
+  const question = $("query").value.trim();
+  if (!question) { $("status").textContent = "Enter your question first."; return; }
+
+  const btn = $("suggestBtn");
+  btn.disabled = true;
+  $("suggestionNote").style.display = "none";
+  $("status").textContent = "Asking the local LLM for a better search query…";
+
+  try {
+    const resp = await fetch("/api/suggest_query", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      $("status").textContent = "Error: " + (data.error || resp.statusText);
+      return;
+    }
+
+    $("query").value = data.query;
+    $("keywords").value = data.keywords.join(", ");
+    $("useKeywords").checked = true;
+
+    const note = $("suggestionNote");
+    note.textContent = `Original question: "${question}" → AI-suggested query: "${data.query}"` +
+      (data.keywords.length ? ` · keywords: ${data.keywords.join(", ")}` : "");
+    note.style.display = "block";
+
+    await runSearch();
+  } catch (err) {
+    $("status").textContent = "Request failed: " + err;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function renderResults(data) {
+  const container = $("results");
+  container.innerHTML = "";
+
+  if (!data.overall_top_k.length) {
+    container.innerHTML = '<div class="empty">No results found.</div>';
+    return;
+  }
+
+  data.overall_top_k.forEach((r, idx) => {
+    const card = document.createElement("div");
+    card.className = "card";
+
+    const score = (r.final_score ?? r.score ?? 0).toFixed(4);
+    const headings = (r.metadata && r.metadata.headings) ? r.metadata.headings.join(" > ") : "";
+    const chunkInfo = r.metadata ? `chunk ${r.metadata.chunk_index ?? "?"} · ${r.metadata.token_count ?? "?"} tokens` : "";
+
+    let picturesHtml = "";
+    if (r.pictures && r.pictures.length) {
+      picturesHtml = '<div class="pictures">' + r.pictures.map(p =>
+        `<img src="/api/image?path=${encodeURIComponent(p.path)}" title="${escapeHtml(p.path)}">`
+      ).join("") + "</div>";
+    }
+
+    let tablesHtml = "";
+    const tableData = r.metadata && Array.isArray(r.metadata.table_data) ? r.metadata.table_data : [];
+    if (tableData.length) {
+      tablesHtml = tableData.map((t, ti) => renderTableBlock(t, ti, idx)).join("");
+    }
+
+    card.innerHTML = `
+      <div class="card-top">
+        <div>
+          <strong>#${idx + 1}</strong> ${escapeHtml(r.doc_name || "")}
+          <div class="doc-path" title="${escapeHtml(r.doc_path || "")}">${escapeHtml(r.doc_path || "")}</div>
+        </div>
+        <div class="score">${score}</div>
+      </div>
+      ${headings ? `<div class="headings">${escapeHtml(headings)}</div>` : ""}
+      <div class="meta-line">${escapeHtml(chunkInfo)}${r.query_text ? " · query: “" + escapeHtml(r.query_text) + "”" : ""}</div>
+      ${tablesHtml}
+      <div class="snippet expanded" id="snippet-${idx}">${escapeHtml(r.text || "")}</div>
+      <button class="expand-btn" data-target="snippet-${idx}">Expand / collapse raw chunk text</button>
+      ${r.id ? `<a class="open-doc-btn" href="/api/open_chunk?id=${encodeURIComponent(r.id)}" target="_blank" rel="noopener">Open document at chunk</a>` : ""}
+      ${picturesHtml}
+    `;
+    container.appendChild(card);
+  });
+
+  container.querySelectorAll(".expand-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      document.getElementById(btn.dataset.target).classList.toggle("expanded");
+    });
+  });
+}
+
+function renderTableBlock(tableEntry, tableIdx, cardIdx) {
+  const rows = tableEntry.rows || [];
+  if (!rows.length) return "";
+
+  const [headerRow, ...bodyRows] = rows;
+  const theadHtml = "<thead><tr>" + headerRow.map(c => `<th>${escapeHtml(c)}</th>`).join("") + "</tr></thead>";
+  const tbodyHtml = "<tbody>" + bodyRows.map(row =>
+    "<tr>" + row.map(c => `<td>${escapeHtml(c)}</td>`).join("") + "</tr>"
+  ).join("") + "</tbody>";
+
+  let summaryHtml = "";
+  if (tableEntry.summary) {
+    const summaryId = `table-summary-${cardIdx}-${tableIdx}`;
+    summaryHtml = `
+      <button class="expand-btn" data-target="${summaryId}">AI table summary</button>
+      <div class="snippet expanded" id="${summaryId}">${escapeHtml(tableEntry.summary)}</div>
+    `;
+  }
+
+  const caption = rows.length > 1 ? `Table ${tableIdx + 1} · ${bodyRows.length} row(s)` : `Table ${tableIdx + 1}`;
+
+  return `
+    <div class="table-block">
+      <div class="table-caption">${escapeHtml(caption)}</div>
+      <div class="table-scroll"><table class="data-table">${theadHtml}${tbodyHtml}</table></div>
+      ${summaryHtml}
+    </div>
+  `;
+}
+
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+$("searchBtn").addEventListener("click", runSearch);
+$("suggestBtn").addEventListener("click", suggestAndSearch);
+$("summarizeBtn").addEventListener("click", summarizeReferences);
+$("clearDocFilter").addEventListener("click", () => {
+  Array.from($("docFilter").options).forEach(opt => { opt.selected = false; });
+});
+
+const lightbox = $("lightbox");
+document.addEventListener("click", (e) => {
+  if (e.target.closest(".pictures img")) {
+    lightbox.querySelector("img").src = e.target.src;
+    lightbox.classList.add("open");
+  } else if (lightbox.classList.contains("open")) {
+    lightbox.classList.remove("open");
+  }
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") lightbox.classList.remove("open");
+});
+
+loadDocumentList();
+$("query").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) runSearch();
+});
+</script>
+</body>
+</html>
