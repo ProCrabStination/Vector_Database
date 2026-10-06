@@ -3,6 +3,7 @@ import sys
 import json
 import logging
 import pandas as pd
+import shutil
 import sqlite3
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -34,7 +35,9 @@ from Text_Vectorizing_Ollama import (
 from Vector_Database_Ollama import (
     DB_PATH,
     add_vector,
+    completed_doc_dir,
     document_exists,
+    parse_chunk_name,
     processed_chunk_indices,
 )
 from LLM_Summary_Ollama import summarize_text
@@ -136,6 +139,24 @@ def restart_ollama():
     raise RuntimeError("Ollama failed to start")
 
 # Helper function to process one document fully
+def copy_picture_to_completed(src, completed_dir: Path, chunk_label: Optional[str]) -> str:
+    """Copy one picture crop into <completed_dir>/images and return its final path.
+
+    Page-range chunks each number their crops from 0, so the file is prefixed with the
+    chunk label (e.g. "pages_0001-0010_pictures_0.png") to keep names unique per document.
+    """
+    src = Path(src)
+    name = f"{chunk_label}_{src.name}" if chunk_label else src.name
+    dest = completed_dir / "images" / name
+    if src.is_file():
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if not dest.exists():
+            shutil.copy2(src, dest)
+    else:
+        logging.warning(f"Picture file not found, recording its final path anyway: {src}")
+    return str(dest)
+
+
 def process_single_document(file_path: Path, output_root: Path, input_root: Path):
     if not file_path.exists():
         logging.error(f"File not found: {file_path}")
@@ -152,6 +173,11 @@ def process_single_document(file_path: Path, output_root: Path, input_root: Path
         relative_path = Path(".")
     output_subdir = output_root / relative_path
 
+    # Completed layout: <Completed Documents For Reference>/<doc>/<doc>.<ext> plus <doc>/images/.
+    # The database stores this full-document path, not the 10-page working chunks.
+    completed_dir = Path(completed_doc_dir(file_path.stem))
+    completed_doc = completed_dir / file_path.name
+
     files_to_process: List[Path] = [file_path]
     if file_path.suffix.lower() == ".pdf":
         chunk_output_dir = output_subdir / "_pdf_chunks" / file_path.stem
@@ -167,7 +193,8 @@ def process_single_document(file_path: Path, output_root: Path, input_root: Path
 
         unprocessed_files = []
         for file_unit in files_to_process:
-            if document_exists(file_unit):
+            chunk_info = parse_chunk_name(file_unit.stem)
+            if document_exists(completed_doc, source_chunk=chunk_info[1] if chunk_info else None):
                 print(f"Skipping processed 10-page PDF unit before conversion: {file_unit}")
                 continue
             unprocessed_files.append(file_unit)
@@ -177,8 +204,15 @@ def process_single_document(file_path: Path, output_root: Path, input_root: Path
             print(f"Skipping {file_path}: all 10-page PDF units are already processed.")
             return
 
+    # Keep the full original document with its images in the completed-documents folder
+    completed_dir.mkdir(parents=True, exist_ok=True)
+    if not completed_doc.exists():
+        shutil.copy2(file_path, completed_doc)
+
     for file_unit in files_to_process:
         logging.info(f"\nProcessing file: {file_unit}")
+        chunk_info = parse_chunk_name(file_unit.stem)  # (source, "pages_0001-0010", start, end) or None
+        chunk_label = chunk_info[1] if chunk_info else None
 
         # Step 1: Convert the document
         converted = None
@@ -193,7 +227,7 @@ def process_single_document(file_path: Path, output_root: Path, input_root: Path
             continue
 
         doc = converted.document
-        doc_full_path = str(file_unit)
+        doc_full_path = str(completed_doc)
 
         logging.info(f"✓ Document converted: {file_unit.name}")
 
@@ -211,7 +245,7 @@ def process_single_document(file_path: Path, output_root: Path, input_root: Path
             chunks = chunk_doclingdocument(doc, image_base_path=image_base_path)
             print(f"Total chunks created: {len(chunks)}")
 
-            processed_indices = processed_chunk_indices(doc_full_path)
+            processed_indices = processed_chunk_indices(doc_full_path, source_chunk=chunk_label)
             chunk_indices = list(range(len(chunks)))
             skipped_count = sum(1 for idx in chunk_indices if idx in processed_indices)
             if skipped_count:
@@ -504,7 +538,7 @@ def process_single_document(file_path: Path, output_root: Path, input_root: Path
                             picture_paths.append(picture_path)
 
                 pictures = [
-                    {"ref": ref, "path": path}
+                    {"ref": ref, "path": copy_picture_to_completed(path, completed_dir, chunk_label)}
                     for ref, path in zip(picture_refs, picture_paths)
                 ]
 
@@ -523,6 +557,8 @@ def process_single_document(file_path: Path, output_root: Path, input_root: Path
                     "doc_items_refs": doc_items_refs,
                     "headings": headings,
                 }
+                if chunk_info:  # which pages of the full PDF this section came from
+                    metadata.update({"source_chunk": chunk_label, "page_start": chunk_info[2], "page_end": chunk_info[3]})
 
                 chunks_to_vectorize.append({
                     "index": chunk_index,

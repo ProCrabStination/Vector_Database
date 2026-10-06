@@ -6,6 +6,7 @@ import json
 import faiss
 import numpy as np
 import requests
+import re
 import uuid
 from pathlib import Path
 from annotated_types import doc
@@ -17,25 +18,99 @@ STORE_DIR = os.environ.get("VECDB_STORE_DIR") or os.path.join(os.path.dirname(__
 DB_PATH = os.path.join(STORE_DIR, "meta.db")
 INDEX_PATH = os.path.join(STORE_DIR, "index.faiss")
 
-def document_exists(doc_path):
-    # Ensure doc_path is a string
-    doc_path_str = str(doc_path)
+# Document folder layout (all under DOCS_ROOT):
+#   Inputs/                              new documents are dropped here
+#   Working Directory/                   scratch space for the tools (page chunks, conversions)
+#   Completed Documents For Reference/   finished documents:  <doc>/<doc>.pdf  and  <doc>/images/
+# Stored document and picture paths are relative to DOCS_ROOT (forward slashes), so the
+# database stays valid when the project is moved. Override with VECDB_DOCS_ROOT if needed.
+DOCS_ROOT = os.path.abspath(
+    os.environ.get("VECDB_DOCS_ROOT")
+    or os.path.join(os.path.dirname(os.path.abspath(__file__)), "Documents")
+)
+INPUTS_DIR_NAME = "Inputs"
+WORKING_DIR_NAME = "Working Directory"
+COMPLETED_DIR_NAME = "Completed Documents For Reference"
+
+# 10-page PDF chunks are named "<source>_pages_0001-0010"
+_CHUNK_RE = re.compile(r"^(?P<stem>.+)_pages_(?P<start>\d{4})-(?P<end>\d{4})$")
+
+
+def completed_doc_dir(source_stem):
+    """Absolute path of the completed-documents folder for one source document."""
+    return os.path.join(DOCS_ROOT, COMPLETED_DIR_NAME, source_stem)
+
+
+def parse_chunk_name(stem):
+    """Split "<source>_pages_0001-0010" into (source, "pages_0001-0010", 1, 10); None if not a chunk name."""
+    m = _CHUNK_RE.match(stem)
+    if not m:
+        return None
+    start, end = int(m.group("start")), int(m.group("end"))
+    return m.group("stem"), f"pages_{m.group('start')}-{m.group('end')}", start, end
+
+
+def to_relative(path):
+    """Return `path` relative to DOCS_ROOT with forward slashes (as stored in the database).
+
+    Already-relative paths are only normalized; absolute paths outside DOCS_ROOT are returned
+    unchanged (slashes normalized) since they cannot be made relative.
+    """
+    if path is None:
+        return path
+    p = str(path)
+    if os.path.isabs(p):
+        try:
+            rel = os.path.relpath(p, DOCS_ROOT)
+            if not rel.startswith(".."):
+                p = rel
+        except ValueError:  # different drive
+            pass
+    return p.replace("\\", "/")
+
+
+def resolve_path(path):
+    """Resolve a stored (relative) path to an absolute filesystem path under DOCS_ROOT.
+
+    Returns None if the result would fall outside DOCS_ROOT (path traversal) or `path` is empty.
+    Absolute paths are accepted only if they are inside DOCS_ROOT.
+    """
+    if not path:
+        return None
+    full = os.path.abspath(os.path.join(DOCS_ROOT, str(path).replace("\\", "/")))
+    root = os.path.normcase(DOCS_ROOT)
+    if os.path.normcase(full) != root and not os.path.normcase(full).startswith(root + os.sep):
+        return None
+    return full
+
+def _chunk_filter(source_chunk):
+    """SQL fragment + params restricting rows to one page-range chunk (e.g. "pages_0001-0010")."""
+    if not source_chunk:
+        return "", ()
+    return " AND metadata LIKE ?", (f'%"source_chunk": "{source_chunk}"%',)
+
+
+def document_exists(doc_path, source_chunk=None):
+    """True if the document (optionally one page-range chunk of it) already has stored vectors."""
+    doc_path_str = to_relative(doc_path)
+    extra_sql, extra_params = _chunk_filter(source_chunk)
     conn = sqlite3.connect(DB_PATH)
     try:
         cur = conn.cursor()
-        cur.execute("SELECT 1 FROM vectors WHERE doc_path = ? LIMIT 1", (doc_path_str,))
+        cur.execute("SELECT 1 FROM vectors WHERE doc_path = ?" + extra_sql + " LIMIT 1", (doc_path_str, *extra_params))
         exists = cur.fetchone() is not None
     finally:
         conn.close()
     return exists
 
-def processed_chunk_indices(doc_path):
-    """Return chunk indexes already stored for a document path."""
-    doc_path_str = str(doc_path)
+def processed_chunk_indices(doc_path, source_chunk=None):
+    """Return chunk indexes already stored for a document path (optionally one page-range chunk)."""
+    doc_path_str = to_relative(doc_path)
+    extra_sql, extra_params = _chunk_filter(source_chunk)
     conn = sqlite3.connect(DB_PATH)
     try:
         cur = conn.cursor()
-        cur.execute("SELECT metadata FROM vectors WHERE doc_path = ?", (doc_path_str,))
+        cur.execute("SELECT metadata FROM vectors WHERE doc_path = ?" + extra_sql, (doc_path_str, *extra_params))
         processed = set()
         for (metadata_json,) in cur.fetchall():
             try:
@@ -50,37 +125,37 @@ def processed_chunk_indices(doc_path):
         conn.close()
 
 def list_documents():
-    """Group the store's per-chunk doc_path rows into source documents.
+    """List the source documents in the store (one entry per document).
 
-    Each row's doc_path is a single page-range chunk (e.g.
-    ".../_pdf_chunks/<source>/<source>_pages_0001-0010.pdf"), so a raw distinct
-    list would show one entry per chunk instead of per source document. This
-    groups by the "_pdf_chunks/<source>/" folder (falling back to the file stem
-    for anything that wasn't split that way) so callers -- e.g. a document
-    filter dropdown -- get one entry per real source document.
+    Each document's doc_path is its full file under "Completed Documents For
+    Reference/<doc>/<doc>.<ext>", and "chunk_count" is the number of stored
+    sections. Databases from the older layout, where doc_path was a 10-page chunk
+    under "_pdf_chunks/<source>/", are still grouped by that source folder.
     """
     conn = sqlite3.connect(DB_PATH)
     try:
         cur = conn.cursor()
-        cur.execute("SELECT DISTINCT doc_path FROM vectors")
-        doc_paths = [row[0] for row in cur.fetchall()]
+        cur.execute("SELECT doc_path, COUNT(*) FROM vectors GROUP BY doc_path")
+        doc_rows = cur.fetchall()
     finally:
         conn.close()
 
     groups = {}
-    for dp in doc_paths:
+    for dp, row_count in doc_rows:
         parts = Path(dp).parts
-        if "_pdf_chunks" in parts:
+        if "_pdf_chunks" in parts:  # legacy layout: one doc_path per page-range chunk
             idx = parts.index("_pdf_chunks")
             group_name = parts[idx + 1] if idx + 1 < len(parts) else Path(dp).stem
         else:
             group_name = Path(dp).stem
-        groups.setdefault(group_name, []).append(dp)
+        entry = groups.setdefault(group_name, {"paths": [], "count": 0})
+        entry["paths"].append(dp)
+        entry["count"] += row_count
 
     return sorted(
         (
-            {"name": name, "doc_paths": sorted(paths), "chunk_count": len(paths)}
-            for name, paths in groups.items()
+            {"name": name, "doc_paths": sorted(g["paths"]), "chunk_count": g["count"]}
+            for name, g in groups.items()
         ),
         key=lambda g: g["name"].lower(),
     )
@@ -145,7 +220,12 @@ def add_vector(embedding, doc_path, text, metadata=None, model=None, pictures=No
     index.add(vec)  # one vector
     faiss.write_index(index, INDEX_PATH)
 
-    # store metadata
+    # store metadata (paths are stored relative to DOCS_ROOT)
+    doc_path = to_relative(doc_path)
+    pictures = [
+        {**pic, "path": to_relative(pic["path"])} if isinstance(pic, dict) and pic.get("path") else pic
+        for pic in (pictures or [])
+    ]
     vid = str(uuid.uuid4())
     cur.execute(
         "INSERT INTO vectors (id, position, doc_path, model, text, metadata, pictures, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",

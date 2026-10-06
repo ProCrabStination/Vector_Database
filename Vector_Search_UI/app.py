@@ -228,7 +228,7 @@ def api_summarize_references():
 
 @app.route("/api/image")
 def api_image():
-    path = request.args.get("path", "")
+    path = vdb.resolve_path(request.args.get("path", ""))  # stored paths are relative to the documents root
     if not path or not os.path.isfile(path):
         abort(404)
     mime, _ = mimetypes.guess_type(path)
@@ -238,8 +238,9 @@ def api_image():
 @app.route("/api/document")
 def api_document():
     """Serve a source document (the page-range chunk file) inline, only if it is in the vector store."""
-    path = request.args.get("path", "")
-    if not path or not os.path.isfile(path) or not vdb.document_exists(path):
+    rel_path = request.args.get("path", "")
+    path = vdb.resolve_path(rel_path)
+    if not path or not os.path.isfile(path) or not vdb.document_exists(rel_path):
         abort(404)
     mime, _ = mimetypes.guess_type(path)
     return send_file(path, mimetype=mime or "application/octet-stream", as_attachment=False)
@@ -256,17 +257,22 @@ def _shingles(words, n=3):
     return {" ".join(words[i:i + n]) for i in range(len(words) - n + 1)}
 
 
-def _find_chunk_page(pdf_path, chunk_text):
-    """Return the 1-based PDF page whose text best overlaps the chunk text (1 if undeterminable)."""
+def _find_chunk_page(pdf_path, chunk_text, page_start=1, page_end=None):
+    """Return the 1-based PDF page whose text best overlaps the chunk text.
+
+    Only pages page_start..page_end are searched (the 10-page range the chunk came from);
+    falls back to page_start if undeterminable.
+    """
     import fitz  # PyMuPDF
 
     chunk_shingles = _shingles(_words(chunk_text))
     if not chunk_shingles:
-        return 1
-    best_page, best_score = 1, 0
+        return page_start
+    best_page, best_score = page_start, 0
     with fitz.open(pdf_path) as pdf:
-        for i, page in enumerate(pdf):
-            score = len(chunk_shingles & _shingles(_words(page.get_text())))
+        last = min(page_end or len(pdf), len(pdf))
+        for i in range(page_start - 1, last):
+            score = len(chunk_shingles & _shingles(_words(pdf[i].get_text())))
             if score > best_score:
                 best_page, best_score = i + 1, score
     return best_page
@@ -280,21 +286,28 @@ def api_open_chunk():
     vid = request.args.get("id", "")
     conn = sqlite3.connect(vdb.DB_PATH)
     try:
-        row = conn.execute("SELECT doc_path, text FROM vectors WHERE id = ?", (vid,)).fetchone()
+        row = conn.execute("SELECT doc_path, text, metadata FROM vectors WHERE id = ?", (vid,)).fetchone()
     finally:
         conn.close()
-    if not row or not os.path.isfile(row[0]):
+    full_path = vdb.resolve_path(row[0]) if row else None
+    if not full_path or not os.path.isfile(full_path):
         abort(404)
-    doc_path, text = row
+    doc_path, text, metadata_json = row
+    try:
+        metadata = json.loads(metadata_json or "{}")
+    except (TypeError, ValueError):
+        metadata = {}
+    page_start = int(metadata.get("page_start") or 1)
+    page_end = metadata.get("page_end")
 
-    page = 1
+    page = page_start
     if doc_path.lower().endswith(".pdf"):
         if vid not in _page_cache:
             try:
-                _page_cache[vid] = _find_chunk_page(doc_path, text)
+                _page_cache[vid] = _find_chunk_page(full_path, text, page_start, page_end)
             except Exception:
                 traceback.print_exc()
-                _page_cache[vid] = 1
+                _page_cache[vid] = page_start
         page = _page_cache[vid]
     return redirect(f"/api/document?path={quote(doc_path, safe='')}#page={page}")
 

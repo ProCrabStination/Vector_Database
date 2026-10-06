@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 
 from Docling_Convert_Ollama import process_file
-from Vector_Database_Ollama import DB_PATH
+from Vector_Database_Ollama import DB_PATH, resolve_path
 
 
 def find_affected_doc_paths():
@@ -36,13 +36,20 @@ def find_affected_doc_paths():
 
 def main():
     doc_paths = find_affected_doc_paths()
+    if any(p.startswith("Completed Documents For Reference/") for p in doc_paths):
+        print(
+            "This one-off tool predates the completed-documents layout: the database now points at full\n"
+            "documents (Completed Documents For Reference/<doc>/<doc>.pdf), not 10-page working chunks,\n"
+            "so there is no chunk PDF to re-convert. Re-run the pipeline on the input document instead."
+        )
+        return
     print(f"Found {len(doc_paths)} document(s) with picture references to backfill.\n")
 
     ok, missing, failed = 0, 0, 0
     start = time.time()
 
     for i, doc_path in enumerate(doc_paths, 1):
-        p = Path(doc_path)
+        p = Path(resolve_path(doc_path) or doc_path)  # stored paths are relative to DOCS_ROOT
         elapsed = time.time() - start
         print(f"[{i}/{len(doc_paths)}] ({elapsed:.0f}s elapsed) {p.name}")
 
