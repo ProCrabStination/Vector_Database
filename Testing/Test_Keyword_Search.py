@@ -12,7 +12,7 @@ import faiss
 import json
 import requests
 
-STORE_DIR = os.path.join(os.path.dirname(__file__), "vec_store")
+STORE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "vec_store")
 DB_PATH = os.path.join(STORE_DIR, "meta.db")
 INDEX_PATH = os.path.join(STORE_DIR, "index.faiss")
 
@@ -221,7 +221,7 @@ def main():
 
     text = "71010 LS-Switch of Bank 2 measurement"
 
-    api_key = "REDACTED_API_KEY"
+    api_key = os.getenv("AI_GATEWAY_API_KEY", "")
     api_host = "https://ai-gateway.vitesco.io/v1"
     model = "cohere.embed-multilingual-v3"
 
@@ -306,7 +306,7 @@ def main():
     # Generate progressive keyword list automatically
     progressive_keywords = generate_progressive_keywords(original_keyword)
     
-    markdown_dir = "Test_Documents_Markdown"
+    markdown_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Documents", "Working Directory")
     
     print("=" * 80)
     print("PROGRESSIVE KEYWORD SEARCH")

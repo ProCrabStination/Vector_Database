@@ -916,10 +916,11 @@ def process_file(input_path, output_root):
 def main():
 
     # Create log file in the output directory
-    output_root = Path(r"C:\Users\rperry\source\repos\Thesis Experiments\Testing\Test_Documents_Markdown")
+    repo_root = Path(__file__).resolve().parent
+    output_root = repo_root / "Documents" / "Working Directory"
     output_root.mkdir(parents=True, exist_ok=True)
-    input_root = Path(r"C:\Users\rperry\source\repos\Thesis Experiments\Testing\Test_Documents")
-    Testing_Root = Path(r"C:\Users\rperry\source\repos\Thesis Experiments\Testing")
+    input_root = repo_root / "Documents" / "Inputs"
+    Testing_Root = repo_root / "Testing"
 
     # Validate input directory
     if not input_root.exists():

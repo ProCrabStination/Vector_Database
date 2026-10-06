@@ -1,3 +1,4 @@
+import os
 # ...existing code...
 import requests
 import json
@@ -19,7 +20,7 @@ def _mean_embedding(embs: List[List[float]]) -> List[float]:
     return [x / n for x in mean]
 
 def Vectorize_Text(texts: List[str]
-                      , api_key = "REDACTED_API_KEY"
+                      , api_key = os.getenv("AI_GATEWAY_API_KEY", "")
                       , api_host = "https://ai-gateway.vitesco.io/v1"
                       , model = "cohere.embed-multilingual-v3"):
 

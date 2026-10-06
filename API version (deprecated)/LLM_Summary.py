@@ -38,7 +38,7 @@ def summarize_text(prompt, max_tokens=512, image_paths=None, setup=None, tempera
     """
 
     # Prefer environment variables or caller-provided values over hard-coded secrets
-    api_key = os.getenv("AI_GATEWAY_API_KEY") or "REDACTED_API_KEY"
+    api_key = os.getenv("AI_GATEWAY_API_KEY")
     api_host = os.getenv("AI_GATEWAY_HOST", "https://ai-gateway.vitesco.io/v1")
     model = os.getenv("AI_GATEWAY_MODEL", "anthropic.claude-3-haiku-20240307-v1:0")
 

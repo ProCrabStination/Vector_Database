@@ -234,7 +234,7 @@ def chunk_doclingdocument(doc: DoclingDocument, image_base_path: Optional[Path] 
 
 def main():
     """Example usage of the chunking functionality."""
-    SOURCE = "C:\\Users\\rperry\\source\\repos\\Thesis Experiments\\Testing\\example_converted_document.json"
+    SOURCE = str(Path(__file__).resolve().parent / "Testing" / "example_converted_document.json")
 
     doc = DoclingDocument.load_from_json(SOURCE)
     chunks = chunk_doclingdocument(doc)

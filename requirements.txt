@@ -1,0 +1,28 @@
+# Document conversion / chunking
+docling
+docling-core
+easyocr
+pdfconverter
+pptxtopdf
+ocrmypdf        # Clean_PDF_For_OCR.py (also needs a Tesseract binary on PATH)
+pypdf
+openpyxl
+Pillow
+PyMuPDF         # Vector_Search_UI/app.py (import fitz)
+
+# Vectorizing / database
+numpy
+pandas
+faiss-cpu
+requests
+ollama
+transformers
+annotated-types
+
+# Query / keyword search
+spacy
+nltk
+
+# Output / UI
+rich
+flask

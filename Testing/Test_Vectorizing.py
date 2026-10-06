@@ -63,8 +63,8 @@ def _mean_embedding(embs: List[List[float]]) -> List[float]:
     n = len(embs)
     return [x / n for x in mean]
 
-def VectorizeDocument(document_path = r"C:\Users\uiv11567\source\repos\docling\tests\data\test documents\pptx\16x9 PowerPointTemplate1.pptx"
-                      , api_key = "REDACTED_API_KEY"
+def VectorizeDocument(document_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Documents", "Inputs", "example.pptx")
+                      , api_key = os.getenv("AI_GATEWAY_API_KEY", "")
                       , api_host = "https://ai-gateway.vitesco.io/v1"
                       , model = "cohere.embed-multilingual-v3"):
 

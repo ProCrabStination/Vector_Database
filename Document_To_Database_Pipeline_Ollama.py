@@ -50,7 +50,7 @@ import subprocess
 import time
 import os
 
-OLLAMA_APP = r"C:\Users\rperry\AppData\Local\Programs\Ollama\ollama app.exe"
+OLLAMA_APP = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Ollama", "ollama app.exe")
 PDF_PAGES_PER_CHUNK = 10
 SUMMARY_REQUEST_MAX_CHARS = 10000
 
@@ -636,8 +636,8 @@ def main():
     args = sys.argv
     
     # Set up paths
-    input_root = Path(__file__).parent / "Testing//Test_Documents"
-    output_root = Path(__file__).parent / "Testing//Test_Documents_Markdown"
+    input_root = Path(__file__).resolve().parent / "Documents" / "Inputs"
+    output_root = Path(__file__).resolve().parent / "Documents" / "Working Directory"
     
     # check that the database is writable
     if not can_write_db():

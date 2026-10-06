@@ -10,7 +10,7 @@ import faiss
 import json
 import requests
 
-STORE_DIR = os.path.join(os.path.dirname(__file__), "vec_store")
+STORE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "vec_store")
 DB_PATH = os.path.join(STORE_DIR, "meta.db")
 INDEX_PATH = os.path.join(STORE_DIR, "index.faiss")
 
@@ -157,8 +157,8 @@ def _mean_embedding(embs: List[List[float]]) -> List[float]:
 def Convert_Markdown_To_Vectors(document_path=None, api_key=None, api_host=None, model=None):
 
 
-    # document_path = r"C:\Users\uiv11567\source\repos\MESSelfService\Python\Test_Documents_Markdown"
-    # api_key = "REDACTED_API_KEY"
+    # document_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Documents", "Working Directory")
+    # api_key = os.getenv("AI_GATEWAY_API_KEY", "")
     # api_host = "https://ai-gateway.vitesco.io/v1"
     # model = "cohere.embed-multilingual-v3"
 
