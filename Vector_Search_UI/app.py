@@ -6,16 +6,21 @@ Run with the project's venv, e.g. from the repo root:
 
 Then open http://127.0.0.1:5151 in a browser.
 """
+import codecs
+import itertools
 import json
 import mimetypes
 import os
 import re
+import shlex
+import subprocess
 import sys
+import threading
 import traceback
 
 from urllib.parse import quote
 
-from flask import Flask, jsonify, redirect, render_template, request, send_file, abort
+from flask import Flask, Response, jsonify, redirect, render_template, request, send_file, abort
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if REPO_ROOT not in sys.path:
@@ -129,6 +134,10 @@ def api_search():
     for r in overall:
         r["doc_name"] = os.path.basename(r.get("doc_path", "") or "")
         r["pictures"] = r.get("pictures") or []
+    try:
+        vdb.add_neighbor_chunks(overall)
+    except Exception:  # context is a nicety; never fail the search over it
+        traceback.print_exc()
 
     return jsonify(
         {
@@ -167,16 +176,36 @@ vector database of technical reference documents (electrical codes, product cata
 matter for answering their question.
 
 You will be given the user's question and a numbered list of retrieved passages, each with its source \
-document, section headings, and relevance score.
+document, document address (path), page location, section headings, relevance score, the matched excerpt, \
+and the text of the chunks immediately before and after it as surrounding context.
 
 Respond in plain text (no markdown headers, no code fences), structured like this:
 1. For each passage worth using, write its number, then a one-to-two sentence explanation of why it \
-matters and what it tells the reader -- name the document and section, don't just say "reference 3".
+matters and what it tells the reader -- name the document, page and section, don't just say "reference 3". \
+Use the before/after text to understand the passage in context.
 2. Skip or briefly dismiss passages that are irrelevant or redundant; don't force relevance onto weak matches.
-3. End with a short "Bottom line" paragraph naming the 2-4 references most worth reading in full.
+3. End with a short "Bottom line" paragraph naming the 2-4 references most worth reading in full, with \
+their document address and page.
 
 Be concise and specific.
 """
+
+
+def _page_label(r):
+    """Best page description for a result: the exact PDF page when it can be found, else the chunk's page range."""
+    start, end = r.get("page_start"), r.get("page_end")
+    page = None
+    full_path = vdb.resolve_path(r.get("doc_path") or "")
+    if r.get("id") and full_path and full_path.lower().endswith(".pdf") and os.path.isfile(full_path):
+        try:
+            page = _exact_page(r["id"], full_path, r.get("text") or "", int(start or 1), end)
+        except Exception:
+            traceback.print_exc()
+    if page:
+        return f"page {page} (chunk file covers pages {start}-{end})" if start and end else f"page {page}"
+    if start and end:
+        return f"pages {start}-{end}"
+    return None
 
 
 def _format_results_for_prompt(question, results, max_chars_per_result=700, max_results=15):
@@ -188,11 +217,22 @@ def _format_results_for_prompt(question, results, max_chars_per_result=700, max_
         text = (r.get("text") or "")[:max_chars_per_result]
 
         lines.append(f"[{i}] Document: {doc_name}")
+        if r.get("doc_path"):
+            lines.append(f"    Document address: {r['doc_path']}")
+        page = _page_label(r)
+        if page:
+            lines.append(f"    Location: {page}")
         if headings:
             lines.append(f"    Section: {' > '.join(headings)}")
         if isinstance(score, (int, float)):
             lines.append(f"    Relevance score: {score:.3f}")
-        lines.append(f"    Excerpt: {text}")
+        prev_text = (r.get("prev_text") or "")[-max_chars_per_result:]  # the end of the preceding chunk is the nearest context
+        next_text = (r.get("next_text") or "")[:max_chars_per_result]
+        if prev_text:
+            lines.append(f"    Text before (preceding chunk): {prev_text}")
+        lines.append(f"    Excerpt (matched chunk): {text}")
+        if next_text:
+            lines.append(f"    Text after (following chunk): {next_text}")
         lines.append("")
     return "\n".join(lines)
 
@@ -242,40 +282,36 @@ def api_document():
     path = vdb.resolve_path(rel_path)
     if not path or not os.path.isfile(path) or not vdb.document_exists(rel_path):
         abort(404)
+    pages = request.args.get("pages", "")
+    m = re.fullmatch(r"(\d+)-(\d+)", pages)
+    if m and path.lower().endswith(".pdf"):
+        # Huge PDFs (e.g. multi-GB scans) can't be opened by the browser's viewer, so serve a
+        # small PDF holding just this page window; /api/open_chunk links here for those files.
+        import fitz  # PyMuPDF
+        first, last = int(m.group(1)), int(m.group(2))
+        with fitz.open(path) as src, fitz.open() as out:
+            first = max(1, min(first, src.page_count))
+            last = max(first, min(last, src.page_count))
+            out.insert_pdf(src, from_page=first - 1, to_page=last - 1)
+            data = out.tobytes(garbage=3, deflate=True)
+        return Response(data, mimetype="application/pdf", headers={"Content-Disposition": "inline"})
     mime, _ = mimetypes.guess_type(path)
     return send_file(path, mimetype=mime or "application/octet-stream", as_attachment=False)
 
 
 _page_cache = {}
+LARGE_PDF_BYTES = 200 * 1024 * 1024  # above this, open_chunk serves a page window instead of the whole file
 
 
-def _words(text):
-    return re.findall(r"\w+", (text or "").lower())
-
-
-def _shingles(words, n=3):
-    return {" ".join(words[i:i + n]) for i in range(len(words) - n + 1)}
-
-
-def _find_chunk_page(pdf_path, chunk_text, page_start=1, page_end=None):
-    """Return the 1-based PDF page whose text best overlaps the chunk text.
-
-    Only pages page_start..page_end are searched (the 10-page range the chunk came from);
-    falls back to page_start if undeterminable.
-    """
-    import fitz  # PyMuPDF
-
-    chunk_shingles = _shingles(_words(chunk_text))
-    if not chunk_shingles:
-        return page_start
-    best_page, best_score = page_start, 0
-    with fitz.open(pdf_path) as pdf:
-        last = min(page_end or len(pdf), len(pdf))
-        for i in range(page_start - 1, last):
-            score = len(chunk_shingles & _shingles(_words(pdf[i].get_text())))
-            if score > best_score:
-                best_page, best_score = i + 1, score
-    return best_page
+def _exact_page(vid, pdf_path, text, page_start, page_end):
+    """Cached vdb.find_chunk_page keyed by vector id (falls back to page_start on failure)."""
+    if vid not in _page_cache:
+        try:
+            _page_cache[vid] = vdb.find_chunk_page(pdf_path, text, page_start, page_end)
+        except Exception:
+            traceback.print_exc()
+            _page_cache[vid] = page_start
+    return _page_cache[vid]
 
 
 @app.route("/api/open_chunk")
@@ -302,14 +338,225 @@ def api_open_chunk():
 
     page = page_start
     if doc_path.lower().endswith(".pdf"):
-        if vid not in _page_cache:
-            try:
-                _page_cache[vid] = _find_chunk_page(full_path, text, page_start, page_end)
-            except Exception:
-                traceback.print_exc()
-                _page_cache[vid] = page_start
-        page = _page_cache[vid]
+        page = _exact_page(vid, full_path, text, page_start, page_end)
+    if doc_path.lower().endswith(".pdf") and os.path.getsize(full_path) > LARGE_PDF_BYTES:
+        first, last = max(1, page - 2), page + 2  # api_document clamps to the real page count
+        return redirect(f"/api/document?path={quote(doc_path, safe='')}&pages={first}-{last}#page={page - first + 1}")
     return redirect(f"/api/document?path={quote(doc_path, safe='')}#page={page}")
+
+
+# ---------------------------------------------------------------------------
+# Task runner: launch the repo's Run_*.bat files from the UI and stream their output.
+# ---------------------------------------------------------------------------
+# fields: "text" values become positional args (or "flag value" when `flag` is set), "checkbox"
+# adds `flag` when ticked, "raw" is split shell-style into several args. actions are the buttons;
+# each appends its `extra` args.
+TASKS = [
+    {
+        "id": "pipeline", "title": "Ingest documents (pipeline)", "bat": "Run_Pipeline.bat",
+        "description": "Converts and ingests everything under Documents\\Inputs into the vector database, "
+                       "or a single file if a path is given. Needs a CUDA GPU.",
+        "fields": [{"name": "file", "label": "Single document path (optional, blank = everything in Inputs)",
+                    "type": "text"}],
+        "actions": [{"label": "Run pipeline", "extra": []}],
+    },
+    {
+        "id": "docling", "title": "Docling convert only", "bat": "Run_Docling_Convert.bat",
+        "description": "Converts every document in Documents\\Inputs to Docling JSON/markdown in the Working "
+                       "Directory. Nothing is added to the database. Needs a CUDA GPU.",
+        "fields": [], "actions": [{"label": "Run conversion", "extra": []}],
+    },
+    {
+        "id": "backfill", "title": "Backfill missing images", "bat": "Run_Backfill_Missing_Images.bat",
+        "description": "Re-converts already-ingested PDFs whose picture crops were never saved to disk. "
+                       "Needs a CUDA GPU.",
+        "fields": [], "actions": [{"label": "Run backfill", "extra": []}],
+    },
+    {
+        "id": "clean_pdf", "title": "Clean PDF for OCR", "bat": "Run_Clean_PDF_For_OCR.bat",
+        "description": "Deskews/cleans a poor scan before ingesting it. Needs Tesseract on PATH (unpaper for Clean).",
+        "fields": [
+            {"name": "input", "label": "Input PDF", "type": "text", "required": True},
+            {"name": "output", "label": "Output PDF", "type": "text", "required": True},
+            {"name": "clean", "label": "Also clean with unpaper (--clean)", "type": "checkbox", "flag": "--clean"},
+            {"name": "oversample", "label": "Oversample DPI (optional, e.g. 300)", "type": "text",
+             "flag": "--oversample"},
+        ],
+        "actions": [{"label": "Clean PDF", "extra": []}],
+    },
+    {
+        "id": "query", "title": "Ask Ollama with database context", "bat": "Run_Query.bat",
+        "description": "Asks Ollama a question grounded in the database from a JSON prompt file "
+                       "(blank = Testing\\Example_Prompt.md).",
+        "fields": [
+            {"name": "prompt", "label": "Prompt file (optional)", "type": "text"},
+            {"name": "only", "label": "Print only the response (--only-response)", "type": "checkbox",
+             "flag": "--only-response"},
+        ],
+        "actions": [{"label": "Run query", "extra": []}],
+    },
+    {
+        "id": "db_cli", "title": "Database CLI", "bat": "Run_Database_CLI.bat",
+        "description": "Command-line access to the vector store. Blank prints the help guide. Arguments are "
+                       "split like a POSIX shell, e.g. search_vectors_keywords --json "
+                       "\"[\\\"gearbox torque\\\", 5, 20, true, [\\\"gearbox\\\"]]\"",
+        "fields": [{"name": "args", "label": "Arguments (e.g. list_documents)", "type": "raw"}],
+        "actions": [{"label": "Run", "extra": []}],
+    },
+    {
+        "id": "migrate", "title": "Migrate paths to relative", "bat": "Run_Migrate_Paths.bat",
+        "description": "One-off: migrates vec_store\\meta.db paths to the portable relative layout "
+                       "(meta.db is backed up first).",
+        "fields": [],
+        "actions": [{"label": "Preview (dry run)", "extra": ["--dry-run"]},
+                    {"label": "Apply migration", "extra": [], "danger": True}],
+    },
+    {
+        "id": "populate", "title": "Populate completed documents", "bat": "Run_Populate_Completed.bat",
+        "description": "One-off: builds \"Completed Documents For Reference\" from the old Test_Documents layout "
+                       "(copies only).",
+        "fields": [
+            {"name": "inputs", "label": "Legacy inputs folder (Test_Documents)", "type": "text",
+             "flag": "--legacy-inputs", "required": True},
+            {"name": "working", "label": "Legacy working folder (Test_Documents_Markdown)", "type": "text",
+             "flag": "--legacy-working", "required": True},
+        ],
+        "actions": [{"label": "Preview (dry run)", "extra": ["--dry-run"]},
+                    {"label": "Populate", "extra": [], "danger": True}],
+    },
+    {
+        "id": "mcp", "title": "MCP server (test)", "bat": "Run_MCP_Server.bat",
+        "description": "Starts the vector-docs MCP server over stdio. Claude normally launches it itself; with "
+                       "no client attached it exits immediately.",
+        "fields": [], "actions": [{"label": "Start server", "extra": []}],
+    },
+]
+TASKS_BY_ID = {t["id"]: t for t in TASKS}
+
+_job_counter = itertools.count(1)
+_jobs = {}  # task id -> job dict (the most recent run of that task)
+_jobs_lock = threading.Lock()
+_CMD_METACHARS = set('&|<>^%\r\n')
+_LOCAL_HOSTS = {"127.0.0.1:5151", "localhost:5151"}
+
+
+def _request_allowed():
+    """Only same-origin JSON posts to the local server may start/stop processes (blocks CSRF from other sites)."""
+    return request.is_json and request.host in _LOCAL_HOSTS
+
+
+def _build_args(task, values, action):
+    args = []
+    for f in task["fields"]:
+        value = values.get(f["name"])
+        if f["type"] == "checkbox":
+            if value:
+                args.append(f["flag"])
+            continue
+        value = str(value or "").strip()
+        if not value:
+            if f.get("required"):
+                raise ValueError(f"\"{f['label']}\" is required.")
+            continue
+        if f["type"] == "raw":
+            args.extend(shlex.split(value))
+            continue
+        if f.get("flag"):
+            args.append(f["flag"])
+        args.append(value)
+    args.extend(action["extra"])
+    for a in args:
+        if any(c in _CMD_METACHARS for c in a):
+            raise ValueError("Arguments may not contain & | < > ^ % or line breaks.")
+    return args
+
+
+def _pump_output(job):
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    stream = job["proc"].stdout
+    while True:
+        chunk = stream.read1(4096)
+        if not chunk:
+            break
+        text = decoder.decode(chunk)
+        with _jobs_lock:
+            job["output"] += text
+    with _jobs_lock:
+        job["output"] += decoder.decode(b"", final=True)
+        job["exit_code"] = job["proc"].wait()
+
+
+def _job_state(task_id):
+    job = _jobs.get(task_id)
+    if not job:
+        return {"running": False, "job_id": None, "exit_code": None}
+    return {"running": job["exit_code"] is None, "job_id": job["id"], "exit_code": job["exit_code"],
+            "command": job["command"]}
+
+
+@app.route("/api/tasks")
+def api_tasks():
+    with _jobs_lock:
+        return jsonify([{**t, "state": _job_state(t["id"])} for t in TASKS])
+
+
+@app.route("/api/tasks/<task_id>/run", methods=["POST"])
+def api_task_run(task_id):
+    if not _request_allowed():
+        abort(403)
+    task = TASKS_BY_ID.get(task_id)
+    if not task:
+        abort(404)
+    payload = request.get_json() or {}
+    action_index = int(payload.get("action", 0))
+    if not 0 <= action_index < len(task["actions"]):
+        return jsonify({"error": "Unknown action."}), 400
+    try:
+        args = _build_args(task, payload.get("values") or {}, task["actions"][action_index])
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    with _jobs_lock:
+        if task_id in _jobs and _jobs[task_id]["exit_code"] is None:
+            return jsonify({"error": "This task is already running."}), 409
+        env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
+        # stdin is closed so the trailing "pause" in each .bat returns immediately instead of hanging.
+        proc = subprocess.Popen(
+            ["cmd.exe", "/c", os.path.join(REPO_ROOT, task["bat"]), *args], cwd=REPO_ROOT, env=env,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        job = {"id": next(_job_counter), "proc": proc, "output": "", "exit_code": None,
+               "command": subprocess.list2cmdline([task["bat"], *args])}
+        _jobs[task_id] = job
+    threading.Thread(target=_pump_output, args=(job,), daemon=True).start()
+    return jsonify({"job_id": job["id"], "command": job["command"]})
+
+
+@app.route("/api/tasks/<task_id>/output")
+def api_task_output(task_id):
+    offset = max(0, int(request.args.get("offset", 0)))
+    with _jobs_lock:
+        job = _jobs.get(task_id)
+        if not job:
+            return jsonify({"running": False, "job_id": None, "exit_code": None, "output": "", "next_offset": 0})
+        return jsonify({**_job_state(task_id), "output": job["output"][offset:], "next_offset": len(job["output"])})
+
+
+@app.route("/api/tasks/<task_id>/stop", methods=["POST"])
+def api_task_stop(task_id):
+    if not _request_allowed():
+        abort(403)
+    with _jobs_lock:
+        job = _jobs.get(task_id)
+        running = bool(job) and job["exit_code"] is None
+        pid = job["proc"].pid if running else None
+    if not running:
+        return jsonify({"error": "This task is not running."}), 400
+    # Kill the whole tree (cmd -> python), not just the cmd.exe wrapper.
+    subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True,
+                   creationflags=subprocess.CREATE_NO_WINDOW)
+    return jsonify({"stopped": True})
 
 
 if __name__ == "__main__":

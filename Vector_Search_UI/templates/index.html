@@ -76,6 +76,13 @@
     max-height: 9rem; overflow-y: auto; border-top: 1px solid var(--border); padding-top: 0.6rem;
   }
   .snippet.expanded { max-height: none; }
+  .context-chunk {
+    white-space: pre-wrap; font-size: 0.82rem; line-height: 1.4; color: var(--muted);
+    margin-top: 0.6rem; padding: 0.5rem 0.6rem; border-left: 3px solid var(--border);
+    max-height: 7rem; overflow-y: auto;
+  }
+  .context-label { font-size: 0.72rem; font-weight: 600; margin-bottom: 0.2rem; }
+  #results.hide-context .context-chunk { display: none; }
   .expand-btn {
     background: none; border: none; color: var(--accent); font-size: 0.78rem; padding: 0;
     width: auto; margin-top: 0.4rem; cursor: pointer; text-align: left;
@@ -106,15 +113,50 @@
   .open-doc-btn:hover { text-decoration: underline; }
   .empty { color: var(--muted); font-style: italic; }
   .meta-line { color: var(--muted); font-size: 0.75rem; margin-top: 0.35rem; }
+  nav.tabs { display: flex; gap: 0.4rem; margin-left: auto; }
+  nav.tabs button {
+    margin: 0; width: auto; padding: 0.4rem 0.9rem; font-size: 0.85rem; background: transparent;
+    border: 1px solid var(--border); color: var(--muted);
+  }
+  nav.tabs button:hover { background: var(--panel); }
+  nav.tabs button.active { background: var(--accent); color: white; border-color: var(--accent); }
+  .tasks-view { display: none; padding: 1.5rem; }
+  .task-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 1rem; align-items: start; }
+  .task-card h3 { margin: 0 0 0.3rem; font-size: 1rem; }
+  .task-card .bat { color: var(--muted); font-size: 0.75rem; font-family: Consolas, monospace; }
+  .task-card p { color: var(--muted); font-size: 0.82rem; line-height: 1.4; margin: 0.5rem 0 0; }
+  .task-actions { display: flex; gap: 0.5rem; margin-top: 1rem; flex-wrap: wrap; }
+  .task-actions button { margin: 0; width: auto; padding: 0.5rem 1rem; font-size: 0.85rem; }
+  .btn-danger { background: #9a3412; }
+  .btn-danger:hover { background: #c2410c; }
+  .btn-stop { background: #991b1b; }
+  .btn-stop:hover { background: #b91c1c; }
+  .task-status { font-size: 0.78rem; margin-top: 0.7rem; color: var(--muted); }
+  .task-status.running { color: #facc15; }
+  .task-status.ok { color: var(--score); }
+  .task-status.fail { color: #f87171; }
+  .task-output {
+    display: none; margin: 0.5rem 0 0; background: #020617; border: 1px solid var(--border); border-radius: 6px;
+    padding: 0.6rem; font: 0.75rem/1.4 Consolas, monospace; white-space: pre-wrap; word-break: break-all;
+    max-height: 18rem; overflow-y: auto;
+  }
 </style>
 </head>
 <body>
 <header>
   <h1>Vector Database Search</h1>
   <span class="store">{{ store_dir }}</span>
+  <nav class="tabs">
+    <button type="button" id="tabSearch" class="active">Search</button>
+    <button type="button" id="tabTasks">Run Tasks</button>
+  </nav>
 </header>
 
-<div class="layout">
+<div class="tasks-view" id="tasksView">
+  <div class="task-grid" id="taskGrid"></div>
+</div>
+
+<div class="layout" id="searchView">
   <div class="panel search-panel">
     <label for="query">Query (one per line = multiple queries)</label>
     <textarea id="query" placeholder="e.g. Class I Division 1 conduit seal requirements"></textarea>
@@ -136,6 +178,11 @@
     <label for="docFilter">Filter by document (optional, ctrl/cmd-click for multiple)</label>
     <select id="docFilter" multiple size="6"></select>
     <button type="button" id="clearDocFilter" class="btn-tertiary" style="margin-top: 0.4rem;">Clear document filter</button>
+
+    <div class="checkbox-row">
+      <input type="checkbox" id="showContext" checked>
+      <label for="showContext">Show previous and next chunk as context</label>
+    </div>
 
     <div class="checkbox-row">
       <input type="checkbox" id="useKeywords" checked>
@@ -245,7 +292,13 @@ async function summarizeReferences() {
   box.textContent = "Asking the local LLM to review the results…";
 
   const trimmedResults = lastResults.map(r => ({
+    id: r.id,
     doc_name: r.doc_name,
+    doc_path: r.doc_path,
+    page_start: r.metadata ? r.metadata.page_start : null,
+    page_end: r.metadata ? r.metadata.page_end : null,
+    prev_text: r.prev_chunk ? r.prev_chunk.text : "",
+    next_text: r.next_chunk ? r.next_chunk.text : "",
     headings: (r.metadata && r.metadata.headings) || [],
     chunk_index: r.metadata ? r.metadata.chunk_index : null,
     score: r.final_score ?? r.score ?? null,
@@ -350,7 +403,9 @@ function renderResults(data) {
       ${headings ? `<div class="headings">${escapeHtml(headings)}</div>` : ""}
       <div class="meta-line">${escapeHtml(chunkInfo)}${r.query_text ? " · query: “" + escapeHtml(r.query_text) + "”" : ""}</div>
       ${tablesHtml}
+      ${contextChunkHtml(r.prev_chunk, "Previous chunk")}
       <div class="snippet expanded" id="snippet-${idx}">${escapeHtml(r.text || "")}</div>
+      ${contextChunkHtml(r.next_chunk, "Next chunk")}
       <button class="expand-btn" data-target="snippet-${idx}">Expand / collapse raw chunk text</button>
       ${r.id ? `<a class="open-doc-btn" href="/api/open_chunk?id=${encodeURIComponent(r.id)}" target="_blank" rel="noopener">Open document at chunk</a>` : ""}
       ${picturesHtml}
@@ -363,6 +418,12 @@ function renderResults(data) {
       document.getElementById(btn.dataset.target).classList.toggle("expanded");
     });
   });
+}
+
+function contextChunkHtml(chunk, label) {
+  if (!chunk || !chunk.text) return "";
+  const idx = chunk.chunk_index != null ? ` (chunk ${chunk.chunk_index})` : "";
+  return `<div class="context-chunk"><div class="context-label">${label}${idx}</div>${escapeHtml(chunk.text)}</div>`;
 }
 
 function renderTableBlock(tableEntry, tableIdx, cardIdx) {
@@ -402,6 +463,9 @@ function escapeHtml(str) {
     .replace(/>/g, "&gt;");
 }
 
+$("showContext").addEventListener("change", () => {
+  $("results").classList.toggle("hide-context", !$("showContext").checked);
+});
 $("searchBtn").addEventListener("click", runSearch);
 $("suggestBtn").addEventListener("click", suggestAndSearch);
 $("summarizeBtn").addEventListener("click", summarizeReferences);
@@ -421,6 +485,123 @@ document.addEventListener("click", (e) => {
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") lightbox.classList.remove("open");
 });
+
+// ---- Run Tasks tab -------------------------------------------------------
+const taskState = {};  // task id -> { offset, text, timer }
+
+function showTab(name) {
+  const tasks = name === "tasks";
+  $("tasksView").style.display = tasks ? "block" : "none";
+  $("searchView").style.display = tasks ? "none" : "flex";
+  $("tabTasks").classList.toggle("active", tasks);
+  $("tabSearch").classList.toggle("active", !tasks);
+  if (tasks && !$("taskGrid").children.length) loadTasks();
+}
+$("tabSearch").addEventListener("click", () => showTab("search"));
+$("tabTasks").addEventListener("click", () => showTab("tasks"));
+
+function collapseCarriageReturns(text) {
+  // Progress bars rewrite the current line with \r; keep only the last rewrite of each line.
+  return text.replace(/\r\n/g, "\n").split("\n").map(l => l.slice(l.lastIndexOf("\r") + 1)).join("\n");
+}
+
+async function loadTasks() {
+  const resp = await fetch("/api/tasks");
+  const tasks = await resp.json();
+  const grid = $("taskGrid");
+  grid.innerHTML = "";
+  tasks.forEach(t => {
+    const card = document.createElement("div");
+    card.className = "panel task-card";
+    card.id = "task-" + t.id;
+    const fields = t.fields.map(f => f.type === "checkbox"
+      ? `<div class="checkbox-row"><input type="checkbox" id="f-${t.id}-${f.name}"><label for="f-${t.id}-${f.name}">${escapeHtml(f.label)}</label></div>`
+      : `<label for="f-${t.id}-${f.name}">${escapeHtml(f.label)}</label><input type="text" id="f-${t.id}-${f.name}">`
+    ).join("");
+    const actions = t.actions.map((a, i) =>
+      `<button type="button" class="${a.danger ? "btn-danger" : ""}" data-action="${i}">${escapeHtml(a.label)}</button>`
+    ).join("");
+    card.innerHTML = `
+      <h3>${escapeHtml(t.title)}</h3>
+      <div class="bat">${escapeHtml(t.bat)}</div>
+      <p>${escapeHtml(t.description)}</p>
+      ${fields}
+      <div class="task-actions">${actions}<button type="button" class="btn-stop" data-stop style="display:none">Stop</button></div>
+      <div class="task-status"></div>
+      <pre class="task-output"></pre>`;
+    card.querySelectorAll("[data-action]").forEach(b =>
+      b.addEventListener("click", () => runTask(t, parseInt(b.dataset.action, 10))));
+    card.querySelector("[data-stop]").addEventListener("click", () => stopTask(t));
+    grid.appendChild(card);
+    taskState[t.id] = { offset: 0, text: "", timer: null };
+    if (t.state.job_id) pollTask(t.id, true);  // re-attach to a run started earlier
+  });
+}
+
+function setTaskUi(id, state) {
+  const card = $("task-" + id);
+  const status = card.querySelector(".task-status");
+  card.querySelectorAll("[data-action]").forEach(b => { b.disabled = state.running; });
+  card.querySelector("[data-stop]").style.display = state.running ? "inline-block" : "none";
+  status.className = "task-status " + (state.running ? "running" : state.exit_code === 0 ? "ok" : state.exit_code == null ? "" : "fail");
+  status.textContent = !state.job_id ? "" :
+    state.running ? `Running: ${state.command}` :
+    `Finished with exit code ${state.exit_code}: ${state.command}`;
+}
+
+async function runTask(task, actionIndex) {
+  const values = {};
+  task.fields.forEach(f => {
+    const el = $(`f-${task.id}-${f.name}`);
+    values[f.name] = f.type === "checkbox" ? el.checked : el.value;
+  });
+  const status = $("task-" + task.id).querySelector(".task-status");
+  const resp = await fetch(`/api/tasks/${task.id}/run`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ values, action: actionIndex }),
+  });
+  if (!resp.ok) {
+    let msg = resp.statusText;
+    try { msg = (await resp.json()).error || msg; } catch (e) {}
+    status.className = "task-status fail";
+    status.textContent = "Error: " + msg;
+    return;
+  }
+  taskState[task.id] = { offset: 0, text: "", timer: null };
+  const out = $("task-" + task.id).querySelector(".task-output");
+  out.textContent = "";
+  out.style.display = "block";
+  pollTask(task.id);
+}
+
+async function stopTask(task) {
+  await fetch(`/api/tasks/${task.id}/stop`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+  });
+}
+
+async function pollTask(id, fresh) {
+  const st = taskState[id];
+  clearTimeout(st.timer);
+  let data;
+  try {
+    data = await (await fetch(`/api/tasks/${id}/output?offset=${st.offset}`)).json();
+  } catch (err) {
+    st.timer = setTimeout(() => pollTask(id), 2000);
+    return;
+  }
+  const out = $("task-" + id).querySelector(".task-output");
+  if (data.output) {
+    st.text = collapseCarriageReturns(st.text + data.output);
+    st.offset = data.next_offset;
+    const atBottom = out.scrollHeight - out.scrollTop - out.clientHeight < 30;
+    out.textContent = st.text;
+    if (atBottom) out.scrollTop = out.scrollHeight;
+  }
+  if (fresh && data.job_id) out.style.display = "block";
+  setTaskUi(id, data);
+  if (data.running) st.timer = setTimeout(() => pollTask(id), 1000);
+}
 
 loadDocumentList();
 $("query").addEventListener("keydown", (e) => {

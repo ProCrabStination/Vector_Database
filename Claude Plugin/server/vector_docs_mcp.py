@@ -38,8 +38,9 @@ mcp = FastMCP(
     "vector-docs",
     instructions=(
         "Search an engineering reference library (electrical codes such as NFPA 70/NEC, product catalogs, "
-        "industry standards, textbooks). Use search_documents for questions; cite the document name and "
-        "pages it returns. Use read_document_pages to read around a hit."
+        "industry standards, textbooks). Use search_documents for questions; each result includes the text "
+        "of the sections before and after the match (text_before / text_after) as context. Cite the document "
+        "name, document_address and page it returns. Use read_document_pages to read around a hit."
     ),
 )
 
@@ -59,17 +60,36 @@ def _result_view(rank, r):
         if isinstance(t, dict):
             tables.append(t.get("markdown") or t.get("rows"))
 
+    file_path = vdb.resolve_path(doc_path) if doc_path else None
+    page = None
+    if file_path and str(file_path).lower().endswith(".pdf") and Path(file_path).is_file() and start:
+        try:
+            with contextlib.redirect_stdout(sys.stderr):
+                page = vdb.find_chunk_page(str(file_path), r.get("text") or "", int(start), end)
+        except Exception:
+            page = None  # fall back to the page range
+
+    def context(chunk):
+        return (chunk or {}).get("text") or ""
+
     return {
         "rank": rank,
         "score": round(float(r.get("score") or 0.0), 4),
         "document": Path(doc_path).stem,
+        # Best-guess single page of the full PDF that holds this section (null if it could not be determined)
+        "page": page,
         # Pages of the full PDF this section was taken from (a section may sit anywhere inside the range)
         "pages": f"{start}-{end}" if start and end else None,
         "headings": meta.get("headings") or [],
         "text": r.get("text") or "",
+        # The sections immediately before and after this one in the document, for surrounding context
+        "text_before": context(r.get("prev_chunk")),
+        "text_after": context(r.get("next_chunk")),
         "tables": tables,
         "images": [str(vdb.resolve_path(p["path"])) for p in (r.get("pictures") or []) if p.get("path")],
-        "file": str(vdb.resolve_path(doc_path)) if doc_path else None,
+        # Address of the document: path relative to the documents root (as stored) and the full file path
+        "document_address": doc_path or None,
+        "file": str(file_path) if file_path else None,
     }
 
 
@@ -122,6 +142,10 @@ def search_documents(
         ) from e
 
     hits = results.get("overall_top_k", [])
+    try:
+        vdb.add_neighbor_chunks(hits)  # context is a nicety; never fail the search over it
+    except Exception:
+        pass
     return {"count": len(hits), "results": [_result_view(i + 1, r) for i, r in enumerate(hits)]}
 
 

@@ -83,6 +83,69 @@ def resolve_path(path):
         return None
     return full
 
+
+def add_neighbor_chunks(results):
+    """Attach the previous/next chunk (same document, insertion order) to each search result as
+    r["prev_chunk"] / r["next_chunk"] = {"text", "chunk_index"} (None at document edges).
+
+    Not done inside the search functions themselves so plain callers (CLI, query script) keep
+    getting just the matched chunk; the web UI and the MCP server call this on the hits they show.
+    """
+    if not any(r.get("id") for r in results):
+        return
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        def neighbor(doc_path, position, after):
+            op, order = (">", "ASC") if after else ("<", "DESC")
+            row = conn.execute(
+                f"SELECT text, metadata FROM vectors WHERE doc_path = ? AND position {op} ? "
+                f"ORDER BY position {order} LIMIT 1",
+                (doc_path, position),
+            ).fetchone()
+            if not row:
+                return None
+            try:
+                chunk_index = (json.loads(row[1] or "{}")).get("chunk_index")
+            except (TypeError, ValueError):
+                chunk_index = None
+            return {"text": row[0] or "", "chunk_index": chunk_index}
+
+        for r in results:
+            row = conn.execute("SELECT doc_path, position FROM vectors WHERE id = ?", (r.get("id"),)).fetchone()
+            if not row:
+                continue
+            r["prev_chunk"] = neighbor(row[0], row[1], after=False)
+            r["next_chunk"] = neighbor(row[0], row[1], after=True)
+    finally:
+        conn.close()
+
+
+def _shingles(text, n=3):
+    words = re.findall(r"\w+", (text or "").lower())
+    return {" ".join(words[i:i + n]) for i in range(len(words) - n + 1)}
+
+
+def find_chunk_page(pdf_path, chunk_text, page_start=1, page_end=None):
+    """Return the 1-based PDF page whose text best overlaps the chunk text.
+
+    Only pages page_start..page_end (the page range the chunk came from) are searched;
+    falls back to page_start if undeterminable.
+    """
+    import pymupdf  # PyMuPDF
+
+    chunk_shingles = _shingles(chunk_text)
+    if not chunk_shingles:
+        return page_start
+    best_page, best_score = page_start, 0
+    with pymupdf.open(pdf_path) as pdf:
+        last = min(page_end or len(pdf), len(pdf))
+        for i in range(page_start - 1, last):
+            score = len(chunk_shingles & _shingles(pdf[i].get_text()))
+            if score > best_score:
+                best_page, best_score = i + 1, score
+    return best_page
+
+
 def _chunk_filter(source_chunk):
     """SQL fragment + params restricting rows to one page-range chunk (e.g. "pages_0001-0010")."""
     if not source_chunk:
