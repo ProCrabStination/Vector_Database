@@ -1,0 +1,9 @@
+{
+  "name": "vector-docs",
+  "version": "1.0.0",
+  "description": "Search a local engineering reference library (electrical codes, product catalogs, standards, textbooks) with semantic + keyword search and read the source pages.",
+  "author": {
+    "name": "rperry"
+  },
+  "keywords": ["search", "documents", "vector-database", "reference", "mcp"]
+}

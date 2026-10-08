@@ -2,6 +2,13 @@
 docling
 docling-core
 easyocr
+onnxruntime   # rapidocr backend; docling logs 'rapidocr cannot be used' without it
+--extra-index-url https://download.pytorch.org/whl/cu128
+# CUDA build of torch is required (Docling_Convert_Ollama.py sets AcceleratorDevice.CUDA);
+# a CPU-only torch crashes the converter. If a CPU build is already installed, run
+# 'pip uninstall torch torchvision' first, or pip will keep it.
+torch
+torchvision
 pdfconverter
 pptxtopdf
 ocrmypdf        # Clean_PDF_For_OCR.py (also needs a Tesseract binary on PATH)
@@ -26,3 +33,4 @@ nltk
 # Output / UI
 rich
 flask
+mcp<2
