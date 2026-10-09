@@ -10,7 +10,9 @@ import logging
 import pandas as pd
 from docling.document_converter import DocumentConverter, PdfFormatOption, WordFormatOption, PowerpointFormatOption
 from docling.datamodel.base_models import InputFormat
-from docling.datamodel.pipeline_options import PdfPipelineOptions, EasyOcrOptions
+from docling.datamodel.pipeline_options import (
+    PdfPipelineOptions, EasyOcrOptions, OcrAutoOptions, OcrMode, RapidOcrOptions, TesseractCliOcrOptions,
+)
 from docling.datamodel.settings import settings as docling_settings
 from docling.datamodel.accelerator_options import AcceleratorOptions, AcceleratorDevice
 from docling_core.types.doc.document import DoclingDocument, PictureItem, TableItem
@@ -69,9 +71,32 @@ pdf_pipeline_options.do_table_structure = True
 pdf_pipeline_options.generate_table_images = False
 pdf_pipeline_options.do_picture_description = False  # Enable picture description generation
 pdf_pipeline_options.do_ocr = True  # Enable OCR for image content extraction
-# RapidOCR (the default "auto" engine) frequently returns empty results on these
-# documents; EasyOCR is more reliable for this content, so force it explicitly.
-# pdf_pipeline_options.ocr_options = EasyOcrOptions(lang=["en"], use_gpu=True)
+
+
+def build_ocr_options(engine=None, full_page=None):
+    """OCR options for Docling, configurable via env vars (so variants can be compared without code edits).
+
+    DOCLING_OCR_ENGINE:     auto (default) | rapidocr | easyocr | tesseract
+    DOCLING_FULL_PAGE_OCR:  1/0 (default 1). When on, every page is OCR'd and the PDF's embedded text
+                            layer is thrown away (OcrMode.FULL_PAGE); when off, Docling keeps the text
+                            layer and only OCRs bitmap regions.
+    """
+    engine = (engine or os.getenv("DOCLING_OCR_ENGINE", "auto")).strip().lower()
+    if full_page is None:
+        full_page = os.getenv("DOCLING_FULL_PAGE_OCR", "1").strip().lower() in ("1", "true", "yes", "on")
+    mode = OcrMode.FULL_PAGE if full_page else OcrMode.DEFAULT
+    if engine == "rapidocr":
+        return RapidOcrOptions(mode=mode)
+    if engine == "easyocr":
+        return EasyOcrOptions(lang=["en"], use_gpu=True, mode=mode)
+    if engine == "tesseract":
+        return TesseractCliOcrOptions(lang=["eng"], mode=mode)
+    if engine != "auto":
+        raise ValueError(f"Unknown DOCLING_OCR_ENGINE '{engine}' (use auto, rapidocr, easyocr or tesseract)")
+    return OcrAutoOptions(mode=mode)
+
+
+pdf_pipeline_options.ocr_options = build_ocr_options()
 # pdf_pipeline_options.do_picture_classification = True  # Enable picture classification to identify image types (e.g., chart, photo, etc.)
 # pdf_pipeline_options.enable_remote_services = False  # Ensure no remote calls are made for image processing
 pdf_pipeline_options.generate_page_images = False  # Generate full-page images to capture complex layouts and embedded content

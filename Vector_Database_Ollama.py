@@ -69,14 +69,31 @@ def to_relative(path):
     return p.replace("\\", "/")
 
 
+def _is_registered_doc_path(doc_path):
+    """True if `doc_path` (forward slashes, as stored) is the doc_path of at least one stored vector."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        return conn.execute("SELECT 1 FROM vectors WHERE doc_path = ? LIMIT 1", (doc_path,)).fetchone() is not None
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()
+
+
 def resolve_path(path):
     """Resolve a stored (relative) path to an absolute filesystem path under DOCS_ROOT.
 
     Returns None if the result would fall outside DOCS_ROOT (path traversal) or `path` is empty.
-    Absolute paths are accepted only if they are inside DOCS_ROOT.
+    Absolute paths are accepted only if they are inside DOCS_ROOT, or if they are the exact path of a
+    document ingested in place (Run_Pipeline_In_Place.bat), i.e. already registered in the database.
     """
     if not path:
         return None
+    if os.path.isabs(str(path)) and _is_registered_doc_path(str(path).replace("\\", "/")):
+        full = os.path.normpath(str(path))
+        root = os.path.normcase(DOCS_ROOT)
+        if os.path.normcase(full) != root and not os.path.normcase(full).startswith(root + os.sep):
+            return full
     full = os.path.abspath(os.path.join(DOCS_ROOT, str(path).replace("\\", "/")))
     root = os.path.normcase(DOCS_ROOT)
     if os.path.normcase(full) != root and not os.path.normcase(full).startswith(root + os.sep):
@@ -162,6 +179,10 @@ def document_exists(doc_path, source_chunk=None):
         cur = conn.cursor()
         cur.execute("SELECT 1 FROM vectors WHERE doc_path = ?" + extra_sql + " LIMIT 1", (doc_path_str, *extra_params))
         exists = cur.fetchone() is not None
+    except sqlite3.OperationalError as e:
+        if "no such table" not in str(e):  # brand-new store: nothing ingested yet
+            raise
+        exists = False
     finally:
         conn.close()
     return exists
@@ -173,7 +194,12 @@ def processed_chunk_indices(doc_path, source_chunk=None):
     conn = sqlite3.connect(DB_PATH)
     try:
         cur = conn.cursor()
-        cur.execute("SELECT metadata FROM vectors WHERE doc_path = ?" + extra_sql, (doc_path_str, *extra_params))
+        try:
+            cur.execute("SELECT metadata FROM vectors WHERE doc_path = ?" + extra_sql, (doc_path_str, *extra_params))
+        except sqlite3.OperationalError as e:
+            if "no such table" not in str(e):  # brand-new store: nothing ingested yet
+                raise
+            return set()
         processed = set()
         for (metadata_json,) in cur.fetchall():
             try:

@@ -96,16 +96,6 @@
   }
   table.data-table thead tr { background: #0b1220; }
   table.data-table tbody tr:nth-child(even) td { background: rgba(255, 255, 255, 0.03); }
-  .pictures { display: flex; gap: 0.5rem; margin-top: 0.6rem; flex-wrap: wrap; }
-  .pictures img {
-    max-height: 90px; border-radius: 4px; border: 1px solid var(--border); cursor: zoom-in;
-  }
-  #lightbox {
-    position: fixed; inset: 0; z-index: 1000; display: none; align-items: center; justify-content: center;
-    background: rgba(0, 0, 0, 0.92); cursor: zoom-out;
-  }
-  #lightbox.open { display: flex; }
-  #lightbox img { width: 100vw; height: 100vh; object-fit: contain; }
   .open-doc-btn {
     display: inline-block; margin-left: 0.75rem; color: var(--accent); font-size: 0.78rem; text-decoration: none;
     border: 1px solid var(--border); border-radius: 4px; padding: 0.1rem 0.5rem;
@@ -122,6 +112,15 @@
   nav.tabs button.active { background: var(--accent); color: white; border-color: var(--accent); }
   .tasks-view { display: none; padding: 1.5rem; }
   .task-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 1rem; align-items: start; }
+  .dropzone {
+    margin-top: 0.9rem; padding: 1.6rem 1rem; text-align: center; color: var(--muted); font-size: 0.88rem;
+    border: 2px dashed var(--border); border-radius: 8px; cursor: pointer; transition: border-color .15s, background .15s;
+  }
+  .dropzone:hover, .dropzone:focus, .dropzone.over { border-color: var(--accent); background: rgba(255, 255, 255, 0.04); color: var(--text); outline: none; }
+  .drop-list { list-style: none; margin: 0.6rem 0 0; padding: 0; font-size: 0.8rem; }
+  .drop-list li { padding: 0.15rem 0; word-break: break-all; }
+  .drop-list .size { color: var(--muted); margin: 0 0.4rem; }
+  .drop-list a { color: var(--accent); font-size: 0.75rem; }
   .task-card h3 { margin: 0 0 0.3rem; font-size: 1rem; }
   .task-card .bat { color: var(--muted); font-size: 0.75rem; font-family: Consolas, monospace; }
   .task-card p { color: var(--muted); font-size: 0.82rem; line-height: 1.4; margin: 0.5rem 0 0; }
@@ -210,7 +209,6 @@
   </div>
 </div>
 
-<div id="lightbox"><img alt=""></div>
 <script>
 const $ = (id) => document.getElementById(id);
 
@@ -379,13 +377,6 @@ function renderResults(data) {
     const headings = (r.metadata && r.metadata.headings) ? r.metadata.headings.join(" > ") : "";
     const chunkInfo = r.metadata ? `chunk ${r.metadata.chunk_index ?? "?"} · ${r.metadata.token_count ?? "?"} tokens` : "";
 
-    let picturesHtml = "";
-    if (r.pictures && r.pictures.length) {
-      picturesHtml = '<div class="pictures">' + r.pictures.map(p =>
-        `<img src="/api/image?path=${encodeURIComponent(p.path)}" title="${escapeHtml(p.path)}">`
-      ).join("") + "</div>";
-    }
-
     let tablesHtml = "";
     const tableData = r.metadata && Array.isArray(r.metadata.table_data) ? r.metadata.table_data : [];
     if (tableData.length) {
@@ -408,7 +399,6 @@ function renderResults(data) {
       ${contextChunkHtml(r.next_chunk, "Next chunk")}
       <button class="expand-btn" data-target="snippet-${idx}">Expand / collapse raw chunk text</button>
       ${r.id ? `<a class="open-doc-btn" href="/api/open_chunk?id=${encodeURIComponent(r.id)}" target="_blank" rel="noopener">Open document at chunk</a>` : ""}
-      ${picturesHtml}
     `;
     container.appendChild(card);
   });
@@ -473,19 +463,6 @@ $("clearDocFilter").addEventListener("click", () => {
   Array.from($("docFilter").options).forEach(opt => { opt.selected = false; });
 });
 
-const lightbox = $("lightbox");
-document.addEventListener("click", (e) => {
-  if (e.target.closest(".pictures img")) {
-    lightbox.querySelector("img").src = e.target.src;
-    lightbox.classList.add("open");
-  } else if (lightbox.classList.contains("open")) {
-    lightbox.classList.remove("open");
-  }
-});
-document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape") lightbox.classList.remove("open");
-});
-
 // ---- Run Tasks tab -------------------------------------------------------
 const taskState = {};  // task id -> { offset, text, timer }
 
@@ -525,6 +502,9 @@ async function loadTasks() {
       <h3>${escapeHtml(t.title)}</h3>
       <div class="bat">${escapeHtml(t.bat)}</div>
       <p>${escapeHtml(t.description)}</p>
+      ${t.dropzone ? `<div class="dropzone" tabindex="0">Drag documents here, or click to browse<input type="file" multiple hidden></div>
+        <ul class="drop-list"></ul>
+        <div class="task-actions"><button type="button" data-ingest disabled>Ingest dropped documents</button><button type="button" class="btn-clear" data-clear style="display:none">Clear</button></div>` : ""}
       ${fields}
       <div class="task-actions">${actions}<button type="button" class="btn-stop" data-stop style="display:none">Stop</button></div>
       <div class="task-status"></div>
@@ -532,6 +512,7 @@ async function loadTasks() {
     card.querySelectorAll("[data-action]").forEach(b =>
       b.addEventListener("click", () => runTask(t, parseInt(b.dataset.action, 10))));
     card.querySelector("[data-stop]").addEventListener("click", () => stopTask(t));
+    if (t.dropzone) setupDropzone(t, card);
     grid.appendChild(card);
     taskState[t.id] = { offset: 0, text: "", timer: null };
     if (t.state.job_id) pollTask(t.id, true);  // re-attach to a run started earlier
@@ -542,11 +523,93 @@ function setTaskUi(id, state) {
   const card = $("task-" + id);
   const status = card.querySelector(".task-status");
   card.querySelectorAll("[data-action]").forEach(b => { b.disabled = state.running; });
+  const ingestBtn = card.querySelector("[data-ingest]");
+  if (ingestBtn) {
+    ingestBtn.dataset.running = state.running ? "1" : "";
+    ingestBtn.disabled = state.running || !(dropped[id] && dropped[id].length);
+  }
   card.querySelector("[data-stop]").style.display = state.running ? "inline-block" : "none";
   status.className = "task-status " + (state.running ? "running" : state.exit_code === 0 ? "ok" : state.exit_code == null ? "" : "fail");
   status.textContent = !state.job_id ? "" :
     state.running ? `Running: ${state.command}` :
     `Finished with exit code ${state.exit_code}: ${state.command}`;
+}
+
+// ---- Drag-and-drop ingest ------------------------------------------------
+const dropped = {};  // task id -> [File]
+
+function setupDropzone(task, card) {
+  const zone = card.querySelector(".dropzone");
+  const input = zone.querySelector("input");
+  const list = card.querySelector(".drop-list");
+  const ingestBtn = card.querySelector("[data-ingest]");
+  const clearBtn = card.querySelector("[data-clear]");
+  const status = card.querySelector(".task-status");
+  dropped[task.id] = [];
+
+  function render() {
+    const files = dropped[task.id];
+    list.innerHTML = files.map((f, i) =>
+      `<li>${escapeHtml(f.name)} <span class="size">${(f.size / 1048576).toFixed(1)} MB</span> <a href="#" data-rm="${i}">remove</a></li>`
+    ).join("");
+    ingestBtn.disabled = !files.length || !!ingestBtn.dataset.running;
+    ingestBtn.textContent = files.length ? `Ingest ${files.length} document${files.length > 1 ? "s" : ""}` : "Ingest dropped documents";
+    clearBtn.style.display = files.length ? "inline-block" : "none";
+  }
+  function add(fileList) {
+    Array.from(fileList).forEach(f => {
+      if (f.size === 0 && !f.type) return;  // folders show up as empty, typeless entries
+      if (!dropped[task.id].some(x => x.name === f.name && x.size === f.size)) dropped[task.id].push(f);
+    });
+    render();
+  }
+
+  zone.addEventListener("click", () => input.click());
+  zone.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); input.click(); } });
+  input.addEventListener("change", () => { add(input.files); input.value = ""; });
+  ["dragenter", "dragover"].forEach(ev => zone.addEventListener(ev, e => { e.preventDefault(); zone.classList.add("over"); }));
+  ["dragleave", "drop"].forEach(ev => zone.addEventListener(ev, e => { e.preventDefault(); zone.classList.remove("over"); }));
+  zone.addEventListener("drop", e => add(e.dataTransfer.files));
+  list.addEventListener("click", e => {
+    const rm = e.target.closest("[data-rm]");
+    if (!rm) return;
+    e.preventDefault();
+    dropped[task.id].splice(parseInt(rm.dataset.rm, 10), 1);
+    render();
+  });
+  clearBtn.addEventListener("click", () => { dropped[task.id] = []; render(); });
+
+  ingestBtn.addEventListener("click", async () => {
+    const form = new FormData();
+    dropped[task.id].forEach(f => form.append("files", f, f.name));
+    ingestBtn.disabled = true;
+    status.className = "task-status running";
+    status.textContent = "Uploading…";
+    let resp;
+    try {
+      resp = await fetch("/api/ingest", { method: "POST", headers: { "X-Requested-With": "vector-ui" }, body: form });
+    } catch (err) {
+      status.className = "task-status fail";
+      status.textContent = "Upload failed: " + err;
+      render();
+      return;
+    }
+    if (!resp.ok) {
+      let msg = resp.statusText;
+      try { msg = (await resp.json()).error || msg; } catch (e) {}
+      status.className = "task-status fail";
+      status.textContent = "Error: " + msg;
+      render();
+      return;
+    }
+    dropped[task.id] = [];
+    render();
+    taskState[task.id] = { offset: 0, text: "", timer: null };
+    const out = card.querySelector(".task-output");
+    out.textContent = "";
+    out.style.display = "block";
+    pollTask(task.id);
+  });
 }
 
 async function runTask(task, actionIndex) {

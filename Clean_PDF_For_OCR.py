@@ -51,6 +51,12 @@ def clean_pdf(input_path, output_path, oversample=300, extra_clean=False):
         # Re-add it once a newer ocrmypdf release restores support.
         "--oversample", str(oversample),
         "--force-ocr",  # rasterize + reprocess every page, even ones with an existing (bad) text layer
+        # Keep the cleaned file small: plain PDF (no PDF/A conversion, which inflated one file 52x) and
+        # lossy-but-gentle image optimization. -O2 needs pngquant on PATH (hard error otherwise), so fall
+        # back to the lossless -O1; jbig2 (if installed) is picked up automatically for 1-bit images.
+        "--output-type", "pdf",
+        "--optimize", "2" if shutil.which("pngquant") else "1",
+        "--jpeg-quality", "85",
     ]
     if extra_clean:
         if shutil.which("unpaper") is None:

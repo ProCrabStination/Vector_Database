@@ -32,12 +32,12 @@ Re-running the pipeline is safe: chunks already in the database are skipped.
   | Purpose | Default model | Override with |
   |---|---|---|
   | Embeddings | `nomic-embed-text-v2-moe` | `OLLAMA_EMBEDDING_MODEL` |
-  | Table / reference summaries, answers | `gemma3:4b` | `AI_SUMMARY_MODEL` (summaries) |
+  | Table / reference summaries, answers | `qwen3-vl:4b-instruct` | `AI_SUMMARY_MODEL` (summaries) |
   | Page-image transcription (vision) | `gemma4:12b` | `AI_VISION_MODEL`, `AI_VISION_HOST` |
 
   ```
   ollama pull nomic-embed-text-v2-moe
-  ollama pull gemma3:4b
+  ollama pull qwen3-vl:4b-instruct
   ollama pull gemma4:12b
   ```
 - **LibreOffice** at `C:\Program Files\LibreOffice\program\soffice.exe` for Word/PowerPoint/Excel input.
@@ -151,7 +151,7 @@ and `read_document_pages`. Install steps and the one-time `set_project_home.bat`
 |---|---|---|
 | `OLLAMA_HOST` | Ollama server for model info and summaries | `http://localhost:11434` |
 | `OLLAMA_EMBEDDING_MODEL` | Embedding model | `nomic-embed-text-v2-moe` |
-| `AI_SUMMARY_MODEL` | Summary model | `gemma3:4b` |
+| `AI_SUMMARY_MODEL` | Summary model | `qwen3-vl:4b-instruct` |
 | `AI_VISION_MODEL` / `AI_VISION_HOST` | Vision model and host | `gemma4:12b` / `http://localhost:11434` |
 | `AI_GATEWAY_HOST` / `AI_GATEWAY_API_KEY` | Host and key for `Run_Query.bat` | `http://localhost:11434` / none |
 | `VECDB_STORE_DIR` | Where `index.faiss` and `meta.db` live | `vec_store/` |

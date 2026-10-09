@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import hashlib
 import logging
 import pandas as pd
 import shutil
@@ -19,6 +20,7 @@ def _excel_safe(value):
     return value
 
 # Import custom modules
+from Clean_PDF_For_OCR import clean_pdf
 from Docling_Convert_Ollama import process_file, is_supported_file
 from Hybrid_Chunking_Ollama import (
     chunk_doclingdocument,
@@ -55,7 +57,7 @@ import os
 
 OLLAMA_APP = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Ollama", "ollama app.exe")
 PDF_PAGES_PER_CHUNK = 10
-SUMMARY_REQUEST_MAX_CHARS = 10000
+CLEAN_PDF_DEEP = False  # True also runs unpaper cleanup (needs unpaper on PATH)
 
 
 def split_pdf_into_page_chunks(pdf_path: Path, chunk_output_dir: Path, pages_per_chunk: int = PDF_PAGES_PER_CHUNK) -> List[Path]:
@@ -94,6 +96,45 @@ def split_pdf_into_page_chunks(pdf_path: Path, chunk_output_dir: Path, pages_per
         f"Split PDF into {len(chunk_files)} file(s) of up to {pages_per_chunk} pages: {pdf_path.name}"
     )
     return chunk_files
+
+def pdf_fully_processed(pdf_path: Path, completed_doc: Path) -> bool:
+    """True if every page-range chunk of this PDF is already in the database (avoids cleaning for nothing)."""
+    try:
+        from pypdf import PdfReader
+        total_pages = len(PdfReader(str(pdf_path)).pages)
+    except Exception:
+        return False
+    if total_pages == 0:
+        return False
+    for start_idx in range(0, total_pages, PDF_PAGES_PER_CHUNK):
+        end_idx = min(start_idx + PDF_PAGES_PER_CHUNK, total_pages)
+        chunk_info = parse_chunk_name(f"{pdf_path.stem}_pages_{start_idx + 1:04d}-{end_idx:04d}")
+        if not document_exists(completed_doc, source_chunk=chunk_info[1] if chunk_info else None):
+            return False
+    return True
+
+
+def clean_pdf_step(pdf_path: Path, cleaned_path: Path) -> Path:
+    """Clean a PDF with Clean_PDF_For_OCR (deskew/upsample) and return the cleaned file.
+
+    Reuses an existing cleaned file from an earlier run. If cleaning fails (e.g. Tesseract
+    missing), logs a warning and falls back to the original PDF so ingestion still proceeds.
+    """
+    if os.getenv("PIPELINE_CLEAN_PDF", "1").strip().lower() in ("0", "false", "no", "off"):
+        return pdf_path  # cleaning disabled (e.g. relying on Docling's own full-page OCR instead)
+    if cleaned_path.is_file() and cleaned_path.stat().st_mtime >= pdf_path.stat().st_mtime:
+        logging.info(f"Using previously cleaned PDF: {cleaned_path}")
+        return cleaned_path
+    cleaned_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        logging.info(f"Cleaning PDF: {pdf_path.name}")
+        clean_pdf(pdf_path, cleaned_path, extra_clean=CLEAN_PDF_DEEP)
+        return cleaned_path
+    except Exception as e:
+        logging.warning(f"PDF cleaning failed, using the original file instead: {pdf_path} ({e})")
+        cleaned_path.unlink(missing_ok=True)
+        return pdf_path
+
 
 def restart_ollama():
     # Kill any existing Ollama processes
@@ -157,7 +198,12 @@ def copy_picture_to_completed(src, completed_dir: Path, chunk_label: Optional[st
     return str(dest)
 
 
-def process_single_document(file_path: Path, output_root: Path, input_root: Path):
+def process_single_document(file_path: Path, output_root: Path, input_root: Path, reference_in_place: bool = False):
+    """Ingest one document.
+
+    With reference_in_place the original file is not copied anywhere: the database stores the
+    original's absolute path, and only the extracted picture crops are kept locally.
+    """
     if not file_path.exists():
         logging.error(f"File not found: {file_path}")
         return
@@ -175,14 +221,28 @@ def process_single_document(file_path: Path, output_root: Path, input_root: Path
 
     # Completed layout: <Completed Documents For Reference>/<doc>/<doc>.<ext> plus <doc>/images/.
     # The database stores this full-document path, not the 10-page working chunks.
-    completed_dir = Path(completed_doc_dir(file_path.stem))
-    completed_doc = completed_dir / file_path.name
+    if reference_in_place:
+        # Reference the original where it lives. The folder only holds picture crops, and is keyed by
+        # a hash of the full path so same-named files in different folders don't share images.
+        completed_doc = Path(os.path.abspath(file_path))
+        path_hash = hashlib.sha1(os.path.normcase(str(completed_doc)).encode("utf-8")).hexdigest()[:8]
+        completed_dir = Path(completed_doc_dir(f"{file_path.stem}_{path_hash}"))
+    else:
+        completed_dir = Path(completed_doc_dir(file_path.stem))
+        completed_doc = completed_dir / file_path.name
 
     files_to_process: List[Path] = [file_path]
+    source_path = file_path  # the file that gets split/converted and copied to the completed folder
     if file_path.suffix.lower() == ".pdf":
+        if pdf_fully_processed(file_path, completed_doc):
+            print(f"Skipping {file_path}: all 10-page PDF units are already processed.")
+            return
+
+        source_path = clean_pdf_step(file_path, output_subdir / "_cleaned" / file_path.name)
+
         chunk_output_dir = output_subdir / "_pdf_chunks" / file_path.stem
         try:
-            files_to_process = split_pdf_into_page_chunks(file_path, chunk_output_dir)
+            files_to_process = split_pdf_into_page_chunks(source_path, chunk_output_dir)
         except Exception as e:
             logging.error(f"Error splitting PDF into {PDF_PAGES_PER_CHUNK}-page chunks: {file_path} ({e})")
             return
@@ -205,10 +265,12 @@ def process_single_document(file_path: Path, output_root: Path, input_root: Path
             return
 
     # Keep the full original document with its images in the completed-documents folder
-    completed_dir.mkdir(parents=True, exist_ok=True)
-    if not completed_doc.exists():
-        shutil.copy2(file_path, completed_doc)
+    if not reference_in_place:
+        completed_dir.mkdir(parents=True, exist_ok=True)
+        if not completed_doc.exists():
+            shutil.copy2(source_path, completed_doc)
 
+    prev_unit_tail = None  # (final text of the previous unit's last chunk, its end page), for table context
     for file_unit in files_to_process:
         logging.info(f"\nProcessing file: {file_unit}")
         chunk_info = parse_chunk_name(file_unit.stem)  # (source, "pages_0001-0010", start, end) or None
@@ -244,6 +306,7 @@ def process_single_document(file_path: Path, output_root: Path, input_root: Path
             
             chunks = chunk_doclingdocument(doc, image_base_path=image_base_path)
             print(f"Total chunks created: {len(chunks)}")
+            total_chunk_count = len(chunks)
 
             processed_indices = processed_chunk_indices(doc_full_path, source_chunk=chunk_label)
             chunk_indices = list(range(len(chunks)))
@@ -419,12 +482,23 @@ def process_single_document(file_path: Path, output_root: Path, input_root: Path
                             # Give the summary model a generous character target; validate the
                             # returned summary against the embedding model's token limit below.
                             prompt_prefix = (
-                                f"Summarize this table and its purpose in no more than {SUMMARY_REQUEST_MAX_CHARS} characters. "
+                                "Summarize this table and its purpose. "
                                 "Preserve the important specifications, identifiers, quantities, ranges, and units. "
                             )
 
                             # Use the previous/next chunk's text as surrounding context
-                            context_before = chunker.contextualize(chunk=chunks[position - 1]) if position > 0 else ""
+                            # Prefer the previous chunk's final text (its table summaries already filled in), so a
+                            # table that follows a table-only chunk still gets meaningful context. That chunk can
+                            # be the last one of the previous 10-page unit.
+                            if chunks_to_vectorize and chunks_to_vectorize[-1]["index"] == chunk_index - 1:
+                                context_before = chunks_to_vectorize[-1]["text"]
+                            elif (position == 0 and chunk_index == 0 and prev_unit_tail and chunk_info
+                                  and prev_unit_tail[1] + 1 == chunk_info[2]):
+                                context_before = prev_unit_tail[0]
+                            elif position > 0:
+                                context_before = chunker.contextualize(chunk=chunks[position - 1])
+                            else:
+                                context_before = ""
                             context_after = chunker.contextualize(chunk=chunks[position + 1]) if position < len(chunks) - 1 else ""
                             prompt_prefix = f"{prompt_prefix}\n Section Headings: {', '.join(headings)}\n Chunk Before Table: {context_before}\n Chunk After Table: {context_after}\n Table To Summarize:\n"
 
@@ -567,6 +641,12 @@ def process_single_document(file_path: Path, output_root: Path, input_root: Path
                     "pictures": pictures,
                 })
 
+            # Remember this unit's last chunk (and its end page) as context for the next unit's first chunk
+            if chunk_info and chunks_to_vectorize and chunks_to_vectorize[-1]["index"] == total_chunk_count - 1:
+                prev_unit_tail = (chunks_to_vectorize[-1]["text"], chunk_info[3])
+            else:
+                prev_unit_tail = None
+
             # After chunks_to_vectorize prepared
             print(f"Total chunks prepared for vectorization: {len(chunks_to_vectorize)}")
 
@@ -670,20 +750,34 @@ def can_write_db():
                 
 def main():
     args = sys.argv
-    
+
     # Set up paths
     input_root = Path(__file__).resolve().parent / "Documents" / "Inputs"
     output_root = Path(__file__).resolve().parent / "Documents" / "Working Directory"
-    
+
+    # --in-place <folder>: scan that folder (and subfolders) and reference the originals instead of copying them
+    reference_in_place = False
+    if "--in-place" in args:
+        idx = args.index("--in-place")
+        if idx + 1 >= len(args):
+            logging.error("--in-place needs a folder path.")
+            return
+        input_root = Path(os.path.abspath(args[idx + 1]))
+        reference_in_place = True
+        args = args[:idx] + args[idx + 2:]
+        if not input_root.is_dir():
+            logging.error(f"Folder not found: {input_root}")
+            return
+
     # check that the database is writable
     if not can_write_db():
         logging.error(f"Database {DB_PATH} is not writable. Please check permissions.")
         return
-    
+
     if len(args) >= 2:
-        # Process single file
-        single_doc_path = Path(args[1])
-        process_single_document(single_doc_path, output_root, input_root)
+        # Process the given file(s)
+        for doc_arg in args[1:]:
+            process_single_document(Path(doc_arg), output_root, input_root)
         
     else:
         # Process all files recursively in input directory, one at a time
@@ -704,7 +798,7 @@ def main():
                 print(f"Processing file: {file_path}")
                 print(f"{'='*60}")
 
-                process_single_document(file_path, output_root, input_root)
+                process_single_document(file_path, output_root, input_root, reference_in_place)
 
                 processed_count += 1
         

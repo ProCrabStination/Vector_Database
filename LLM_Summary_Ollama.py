@@ -24,7 +24,7 @@ DEFAULT_SETUP = (""
     # "- Gold boards: Known good boards for verifying test bay functionality\n"
 )
 
-SUMMARY_MODEL = os.getenv("AI_SUMMARY_MODEL", "gemma3:4b")
+SUMMARY_MODEL = os.getenv("AI_SUMMARY_MODEL", "qwen3-vl:4b-instruct")
 SUMMARY_MODEL_MAX_INPUT_TOKENS = get_model_context_length(SUMMARY_MODEL)
 # None = never time out (requests waits indefinitely for Ollama).
 SUMMARY_REQUEST_TIMEOUT = None

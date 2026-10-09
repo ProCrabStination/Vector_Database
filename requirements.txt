@@ -2,7 +2,7 @@
 docling
 docling-core
 easyocr
-onnxruntime   # rapidocr backend; docling logs 'rapidocr cannot be used' without it
+onnxruntime-gpu   # rapidocr backend (GPU build; the plain onnxruntime package conflicts with it); docling logs 'rapidocr cannot be used' without it
 --extra-index-url https://download.pytorch.org/whl/cu128
 # CUDA build of torch is required (Docling_Convert_Ollama.py sets AcceleratorDevice.CUDA);
 # a CPU-only torch crashes the converter. If a CPU build is already installed, run

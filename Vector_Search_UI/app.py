@@ -133,7 +133,6 @@ def api_search():
     overall = results.get("overall_top_k", [])
     for r in overall:
         r["doc_name"] = os.path.basename(r.get("doc_path", "") or "")
-        r["pictures"] = r.get("pictures") or []
     try:
         vdb.add_neighbor_chunks(overall)
     except Exception:  # context is a nicety; never fail the search over it
@@ -266,15 +265,6 @@ def api_summarize_references():
     return jsonify({"summary": raw})
 
 
-@app.route("/api/image")
-def api_image():
-    path = vdb.resolve_path(request.args.get("path", ""))  # stored paths are relative to the documents root
-    if not path or not os.path.isfile(path):
-        abort(404)
-    mime, _ = mimetypes.guess_type(path)
-    return send_file(path, mimetype=mime or "application/octet-stream")
-
-
 @app.route("/api/document")
 def api_document():
     """Serve a source document (the page-range chunk file) inline, only if it is in the vector store."""
@@ -354,11 +344,18 @@ def api_open_chunk():
 TASKS = [
     {
         "id": "pipeline", "title": "Ingest documents (pipeline)", "bat": "Run_Pipeline.bat",
-        "description": "Converts and ingests everything under Documents\\Inputs into the vector database, "
-                       "or a single file if a path is given. Needs a CUDA GPU.",
-        "fields": [{"name": "file", "label": "Single document path (optional, blank = everything in Inputs)",
-                    "type": "text"}],
-        "actions": [{"label": "Run pipeline", "extra": []}],
+        "description": "Drop documents onto the box to convert and ingest them into the vector database "
+                       "(they are saved to Documents\\Inputs first). Needs a CUDA GPU.",
+        "dropzone": True,
+        "fields": [],
+        "actions": [{"label": "Ingest everything already in Inputs", "extra": []}],
+    },
+    {
+        "id": "pipeline_in_place", "title": "Ingest folder in place (no copies)", "bat": "Run_Pipeline_In_Place.bat",
+        "description": "Ingests every document in a folder and its subfolders. Originals are not copied: the "
+                       "database stores their original paths. Needs a CUDA GPU.",
+        "fields": [{"name": "folder", "label": "Folder to scan", "type": "text", "required": True}],
+        "actions": [{"label": "Run in-place ingest", "extra": []}],
     },
     {
         "id": "docling", "title": "Docling convert only", "bat": "Run_Docling_Convert.bat",
@@ -442,7 +439,8 @@ _LOCAL_HOSTS = {"127.0.0.1:5151", "localhost:5151"}
 
 def _request_allowed():
     """Only same-origin JSON posts to the local server may start/stop processes (blocks CSRF from other sites)."""
-    return request.is_json and request.host in _LOCAL_HOSTS
+    # Also require a loopback client so that, in --lan mode, other machines can search but never run tasks.
+    return request.is_json and request.host in _LOCAL_HOSTS and request.remote_addr in ("127.0.0.1", "::1")
 
 
 def _build_args(task, values, action):
@@ -515,7 +513,15 @@ def api_task_run(task_id):
         args = _build_args(task, payload.get("values") or {}, task["actions"][action_index])
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
+    return _start_job(task_id, task, args)
 
+
+def _task_running(task_id):
+    with _jobs_lock:
+        return task_id in _jobs and _jobs[task_id]["exit_code"] is None
+
+
+def _start_job(task_id, task, args):
     with _jobs_lock:
         if task_id in _jobs and _jobs[task_id]["exit_code"] is None:
             return jsonify({"error": "This task is already running."}), 409
@@ -531,6 +537,73 @@ def api_task_run(task_id):
         _jobs[task_id] = job
     threading.Thread(target=_pump_output, args=(job,), daemon=True).start()
     return jsonify({"job_id": job["id"], "command": job["command"]})
+
+
+UPLOAD_EXTENSIONS = {
+    ".doc", ".docx", ".rtf", ".odt", ".xls", ".xlsx", ".ods", ".csv",
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp",
+    ".ppt", ".pptx", ".odp", ".pdf",
+}  # mirrors Docling_Convert_Ollama.ALL_SUPPORTED_EXTENSIONS (not imported: it loads Docling/torch)
+
+
+def _upload_allowed():
+    """Multipart posts can't use the is_json CSRF guard, so require a custom header (forces a CORS preflight).
+
+    Unlike the task runner, uploads are deliberately open to other machines on the LAN (--lan mode).
+    """
+    return request.headers.get("X-Requested-With") == "vector-ui"
+
+
+def _unique_upload_path(dest_dir, filename, size):
+    """Path in dest_dir for an uploaded file; reuses an identical-size file of the same name, else numbers it."""
+    stem, ext = os.path.splitext(filename)
+    candidate, n = os.path.join(dest_dir, filename), 0
+    while os.path.exists(candidate):
+        if os.path.getsize(candidate) == size:
+            return candidate, True
+        n += 1
+        candidate = os.path.join(dest_dir, f"{stem}_{n}{ext}")
+    return candidate, False
+
+
+@app.route("/api/ingest", methods=["POST"])
+def api_ingest():
+    """Save dropped documents into Documents/Inputs and ingest exactly those files with the pipeline."""
+    from werkzeug.utils import secure_filename
+
+    if not _upload_allowed():
+        abort(403)
+    task = TASKS_BY_ID["pipeline"]
+    files = [f for f in request.files.getlist("files") if f and f.filename]
+    if not files:
+        return jsonify({"error": "No files received."}), 400
+    if _task_running("pipeline"):
+        return jsonify({"error": "The pipeline is already running."}), 409
+
+    rejected = [f.filename for f in files if os.path.splitext(f.filename)[1].lower() not in UPLOAD_EXTENSIONS]
+    if rejected:
+        return jsonify({"error": "Unsupported file type: " + ", ".join(rejected)}), 400
+
+    dest_dir = os.path.join(vdb.DOCS_ROOT, vdb.INPUTS_DIR_NAME)
+    os.makedirs(dest_dir, exist_ok=True)
+    saved = []
+    for f in files:
+        name = secure_filename(f.filename)
+        ext = os.path.splitext(f.filename)[1].lower()
+        if not os.path.splitext(name)[0]:  # e.g. a name made only of non-ASCII characters
+            name = "document" + ext
+        f.save(tmp := os.path.join(dest_dir, f"~upload_{os.getpid()}_{len(saved)}"))
+        size = os.path.getsize(tmp)
+        target, exists = _unique_upload_path(dest_dir, name, size)
+        if exists:
+            os.remove(tmp)
+        else:
+            os.replace(tmp, target)
+        saved.append(target)
+
+    if any(any(c in _CMD_METACHARS for c in p) for p in saved):
+        return jsonify({"error": "The Documents path contains characters that can't be passed to the pipeline."}), 400
+    return _start_job("pipeline", task, saved)
 
 
 @app.route("/api/tasks/<task_id>/output")
@@ -560,4 +633,15 @@ def api_task_stop(task_id):
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5151, debug=False)
+    import socket
+    import sys
+    if "--lan" in sys.argv:
+        try:
+            lan_ip = socket.gethostbyname(socket.gethostname())
+        except OSError:
+            lan_ip = "<this-pc-ip>"
+        print(f"LAN mode: other machines on the network can use http://{lan_ip}:5151 (search and "
+              f"drag-and-drop ingest; other batch tasks remain restricted to this PC).")
+        app.run(host="0.0.0.0", port=5151, debug=False, threaded=True)
+    else:
+        app.run(host="127.0.0.1", port=5151, debug=False)
