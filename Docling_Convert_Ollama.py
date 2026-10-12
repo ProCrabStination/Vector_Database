@@ -8,7 +8,9 @@ import tempfile
 from pathlib import Path
 import logging
 import pandas as pd
-from docling.document_converter import DocumentConverter, PdfFormatOption, WordFormatOption, PowerpointFormatOption
+from docling.document_converter import (
+    DocumentConverter, ImageFormatOption, PdfFormatOption, WordFormatOption, PowerpointFormatOption,
+)
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import (
     PdfPipelineOptions, EasyOcrOptions, OcrAutoOptions, OcrMode, RapidOcrOptions, TesseractCliOcrOptions,
@@ -76,12 +78,12 @@ pdf_pipeline_options.do_ocr = True  # Enable OCR for image content extraction
 def build_ocr_options(engine=None, full_page=None):
     """OCR options for Docling, configurable via env vars (so variants can be compared without code edits).
 
-    DOCLING_OCR_ENGINE:     auto (default) | rapidocr | easyocr | tesseract
+    DOCLING_OCR_ENGINE:     easyocr (default) | rapidocr | auto | tesseract
     DOCLING_FULL_PAGE_OCR:  1/0 (default 1). When on, every page is OCR'd and the PDF's embedded text
                             layer is thrown away (OcrMode.FULL_PAGE); when off, Docling keeps the text
                             layer and only OCRs bitmap regions.
     """
-    engine = (engine or os.getenv("DOCLING_OCR_ENGINE", "auto")).strip().lower()
+    engine = (engine or os.getenv("DOCLING_OCR_ENGINE", "easyocr")).strip().lower()
     if full_page is None:
         full_page = os.getenv("DOCLING_FULL_PAGE_OCR", "1").strip().lower() in ("1", "true", "yes", "on")
     mode = OcrMode.FULL_PAGE if full_page else OcrMode.DEFAULT
@@ -113,6 +115,8 @@ docling_settings.perf.page_batch_size = 5
 doc_converter = DocumentConverter(
     format_options={
         InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_pipeline_options),
+        # Scanned page images get the same full-page OCR as PDFs
+        InputFormat.IMAGE: ImageFormatOption(pipeline_options=pdf_pipeline_options),
         InputFormat.DOCX: WordFormatOption(
             pipeline_options=PdfPipelineOptions(  # Word uses same pipeline options as PDF
                 images_scale=3.0,

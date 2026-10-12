@@ -45,7 +45,7 @@ def get_model_context_length(model_name, api_host):
     # Fallback
     return 128000
 
-context_token_limit = get_model_context_length(model, api_host)
+context_token_limit = min(16000, get_model_context_length(model, api_host))  # cap num_ctx at 16000
 
 # Usage: python MESSS_Query.py "path/to/input.md"
 # Input markdown file should contain JSON: {"prompt": "...", "routing_history": "...", "test_failures": "...", "unit_summary": "...", "unit_id": "...", "chat_history": [...]}

@@ -25,7 +25,8 @@ DEFAULT_SETUP = (""
 )
 
 SUMMARY_MODEL = os.getenv("AI_SUMMARY_MODEL", "qwen3-vl:4b-instruct")
-SUMMARY_MODEL_MAX_INPUT_TOKENS = get_model_context_length(SUMMARY_MODEL)
+MAX_NUM_CTX = 16000  # cap on Ollama num_ctx for all requests
+SUMMARY_MODEL_MAX_INPUT_TOKENS = min(MAX_NUM_CTX, get_model_context_length(SUMMARY_MODEL))
 # None = never time out (requests waits indefinitely for Ollama).
 SUMMARY_REQUEST_TIMEOUT = None
 
@@ -53,6 +54,38 @@ def _truncate_prompt(prompt: str, max_chars: int) -> str:
         return prompt[:max_chars]
 
     return prompt[:keep_head] + marker + prompt[-(keep_tail - len(marker)):]
+
+def ask_vision_model(image_path, prompt):
+    """Send an image (a page, a picture crop, ...) with a prompt to a vision model and return (transcription, model), or (None, None) on failure.
+
+    Models tried in order: AI_VISION_MODEL (if set), then the summary model (qwen3-vl is vision-capable).
+    The host comes from AI_VISION_HOST (default: local Ollama).
+    """
+    try:
+        import ollama
+
+        image_bytes = Path(image_path).read_bytes()
+        client = ollama.Client(host=os.getenv("AI_VISION_HOST", "http://localhost:11434"))
+        last_error = None
+        for model in [m for m in (os.getenv("AI_VISION_MODEL"), SUMMARY_MODEL) if m]:
+            try:
+                response = client.chat(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt, "images": [image_bytes]}],
+                    options={"temperature": 0.1, "num_ctx": SUMMARY_MODEL_MAX_INPUT_TOKENS},
+                )
+                content = response["message"]["content"] if isinstance(response, dict) else response.message.content
+                if content and content.strip():
+                    return content.strip(), model
+            except Exception as e:
+                last_error = e
+                print(f"Vision model {model} failed for {Path(image_path).name}: {e}")
+        if last_error:
+            print(f"No vision transcription generated for {Path(image_path).name}: {last_error}")
+    except Exception as e:
+        print(f"Could not run vision transcription for {Path(image_path).name}: {e}")
+    return None, None
+
 
 # Usage: python Test_Script.py "your prompt" "API_KEY" "API_HOST" "MODEL" "ROUTING_HISTORY" "TEST_FAILURES" "UNIT_SUMMARY" "UNIT_ID"
 def summarize_text(prompt, max_tokens=128000, image_paths=None, setup=None, temperature=0.2):

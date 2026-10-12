@@ -116,6 +116,36 @@ class PicturePathSerializerProvider(ChunkingSerializerProvider):
             table_serializer=TablePlaceholderSerializer(),
         )
     
+class SingleTableHybridChunker(HybridChunker):
+    """HybridChunker that never merges two tables into the same chunk.
+
+    The stock peer-merge step packs consecutive small chunks that share headings,
+    so a run of small tables ends up as one chunk. Each table is summarized
+    separately and needs its own chunk, so the merge is run on groups that each
+    hold at most one table (text next to a table can still merge with it).
+    """
+
+    @staticmethod
+    def _has_table(chunk: DocChunk) -> bool:
+        return any(getattr(it, "label", None) == DocItemLabel.TABLE for it in chunk.meta.doc_items)
+
+    def _merge_chunks_with_matching_metadata(self, chunks: list[DocChunk]):
+        groups: list[list[DocChunk]] = []
+        group_has_table = False
+        for chunk in chunks:
+            chunk_has_table = self._has_table(chunk)
+            if not groups or (chunk_has_table and group_has_table):
+                groups.append([])
+                group_has_table = False
+            groups[-1].append(chunk)
+            group_has_table = group_has_table or chunk_has_table
+
+        merged: list[DocChunk] = []
+        for group in groups:
+            merged.extend(super()._merge_chunks_with_matching_metadata(group))
+        return merged
+
+
 def find_n_th_chunk_with_label(
     iter: Iterable[BaseChunk], n: int, label: DocItemLabel
 ) -> Optional[DocChunk]:
@@ -155,7 +185,7 @@ def chunk_doclingdocument(doc: DoclingDocument, image_base_path: Optional[Path] 
     # Use custom serializer that includes image file paths
     serializer_provider = PicturePathSerializerProvider(base_path=image_base_path)
     
-    chunker = HybridChunker(
+    chunker = SingleTableHybridChunker(
         tokenizer=tokenizer,
         serializer_provider=serializer_provider
     )

@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import re
 import hashlib
 import logging
 import pandas as pd
@@ -42,7 +43,7 @@ from Vector_Database_Ollama import (
     parse_chunk_name,
     processed_chunk_indices,
 )
-from LLM_Summary_Ollama import summarize_text
+from LLM_Summary_Ollama import summarize_text, ask_vision_model
 
 
 # Configure logging
@@ -57,6 +58,9 @@ import os
 
 OLLAMA_APP = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Ollama", "ollama app.exe")
 PDF_PAGES_PER_CHUNK = 10
+DESCRIBE_PICTURES = os.getenv("PIPELINE_DESCRIBE_PICTURES", "1").strip().lower() not in ("0", "false", "no", "off")
+IMAGE_FILE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif', '.webp'}
+PICTURE_MIN_PIXELS = 80  # skip crops smaller than this in either direction (bullets, rules, icons)
 CLEAN_PDF_DEEP = False  # True also runs unpaper cleanup (needs unpaper on PATH)
 
 
@@ -96,6 +100,66 @@ def split_pdf_into_page_chunks(pdf_path: Path, chunk_output_dir: Path, pages_per
         f"Split PDF into {len(chunk_files)} file(s) of up to {pages_per_chunk} pages: {pdf_path.name}"
     )
     return chunk_files
+
+TABLE_PLACEHOLDER_RE = re.compile(r"\[\[TABLE_PLACEHOLDER:[^\]]*\]\]")
+
+
+def describe_picture(image_path, cache: dict) -> Optional[str]:
+    """Short vision-model description of one picture crop (None if missing, decorative or unreadable).
+
+    Cached per image path, since the chunker can attach the same picture to several nearby chunks.
+    """
+    key = str(image_path)
+    if key in cache:
+        return cache[key]
+    description = None
+    try:
+        if Path(image_path).is_file():
+            from PIL import Image
+            with Image.open(image_path) as im:
+                big_enough = min(im.size) >= PICTURE_MIN_PIXELS
+            if big_enough:
+                text, model = ask_vision_model(
+                    image_path,
+                    "Describe this image briefly and in general terms: what kind of image it is (photo, diagram, "
+                    "schematic, chart, drawing, screenshot, ...) and what it shows. Mention any legible title or "
+                    "key labels. Do not invent details. If it is purely decorative (a logo, icon, rule, border "
+                    "or blank), reply with just: DECORATIVE.",
+                )
+                if text and text.strip().upper().rstrip(".") != "DECORATIVE":
+                    description = text.strip()
+    except Exception as e:
+        logging.warning(f"Could not describe picture {image_path}: {e}")
+    cache[key] = description
+    return description
+
+
+def vision_table_fallback(unit_pdf: Path, page_no, output_subdir: Path, table_number: int) -> Optional[str]:
+    """Render the page holding an unreadable table and have the vision model transcribe it."""
+    if not page_no or Path(unit_pdf).suffix.lower() != ".pdf":
+        return None
+    try:
+        import pymupdf
+        page_dir = output_subdir / "_vision_pages"
+        page_dir.mkdir(parents=True, exist_ok=True)
+        image_path = page_dir / f"{Path(unit_pdf).stem}_page_{int(page_no):04d}.png"
+        if not image_path.exists():
+            with pymupdf.open(str(unit_pdf)) as pdf:
+                pdf[int(page_no) - 1].get_pixmap(dpi=200).save(str(image_path))
+    except Exception as e:
+        logging.warning(f"Could not render page {page_no} of {unit_pdf} for the vision model: {e}")
+        return None
+
+    prompt = (
+        "Table {n} on this page could not be read by OCR. Look at the full page image and transcribe the "
+        "table content exactly as it appears, reproducing tables as markdown tables, then add one or two "
+        "sentences describing the table's purpose. Do not invent values you cannot see."
+    ).format(n=table_number)
+    text, model = ask_vision_model(image_path, prompt)
+    if text:
+        print(f"  Vision model {model} transcribed page {page_no} ({count_embedding_tokens(text)} tokens).")
+    return text
+
 
 def pdf_fully_processed(pdf_path: Path, completed_doc: Path) -> bool:
     """True if every page-range chunk of this PDF is already in the database (avoids cleaning for nothing)."""
@@ -304,6 +368,16 @@ def process_single_document(file_path: Path, output_root: Path, input_root: Path
             doc_name = doc.name if hasattr(doc, 'name') else 'Unknown'
             image_base_path = output_subdir / doc_name / "images"
             
+            # A photo / image file is one big picture that Docling doesn't report as a PictureItem (it only OCRs it),
+            # so its only text can be stray marks, or nothing at all. Describe the whole image and add that
+            # description to the document so it gets chunked and embedded like any other text.
+            if (DESCRIBE_PICTURES and file_unit.suffix.lower() in IMAGE_FILE_EXTENSIONS and not doc.pictures
+                    and not document_exists(completed_doc)):
+                whole_image_description = describe_picture(file_unit, {})
+                if whole_image_description:
+                    doc.add_text(label=DocItemLabel.TEXT, text=f"[Image: {whole_image_description}]")
+                    print(f"  Added a vision description of the whole image ({file_unit.name})")
+
             chunks = chunk_doclingdocument(doc, image_base_path=image_base_path)
             print(f"Total chunks created: {len(chunks)}")
             total_chunk_count = len(chunks)
@@ -338,6 +412,8 @@ def process_single_document(file_path: Path, output_root: Path, input_root: Path
             )
 
             chunks_to_vectorize = []
+            picture_descriptions = {}  # crop path -> description (per unit)
+            described_pictures = set()  # pictures whose description is already in a chunk's text
 
             for position, chunk in enumerate(chunks):
                 chunk_index = chunk_indices[position]
@@ -408,6 +484,8 @@ def process_single_document(file_path: Path, output_root: Path, input_root: Path
                                         # placeholder into ctx_text (see TablePlaceholderSerializer),
                                         # so it can be located and replaced reliably.
                                         "placeholder": TablePlaceholderSerializer.placeholder_for(item),
+                                        # page of this unit's PDF (1-based), for the vision fallback
+                                        "page_no": item.prov[0].page_no if getattr(item, "prov", None) else None,
                                     })
 
                             except Exception as e:
@@ -481,9 +559,12 @@ def process_single_document(file_path: Path, output_root: Path, input_root: Path
 
                             # Give the summary model a generous character target; validate the
                             # returned summary against the embedding model's token limit below.
+                            # The prompt asks for a moderately detailed (~80-150 word) summary; a strict token limit makes the model return
+                            # garbage. The summary is kept whole; only the embedding step truncates, and only if Ollama rejects the input.
                             prompt_prefix = (
-                                "Summarize this table and its purpose. "
-                                "Preserve the important specifications, identifiers, quantities, ranges, and units. "
+                                "Write a detailed summary of this table using the surrounding context to provide a comprehensive overview."
+                                "Do not copy the table row by row, "
+                                "and use only what the table itself says, and do not make up anything."
                             )
 
                             # Use the previous/next chunk's text as surrounding context
@@ -499,8 +580,28 @@ def process_single_document(file_path: Path, output_root: Path, input_root: Path
                                 context_before = chunker.contextualize(chunk=chunks[position - 1])
                             else:
                                 context_before = ""
-                            context_after = chunker.contextualize(chunk=chunks[position + 1]) if position < len(chunks) - 1 else ""
-                            prompt_prefix = f"{prompt_prefix}\n Section Headings: {', '.join(headings)}\n Chunk Before Table: {context_before}\n Chunk After Table: {context_after}\n Table To Summarize:\n"
+                            # Other tables in the neighbouring text are still placeholders (not summarized yet)
+                            context_before = TABLE_PLACEHOLDER_RE.sub("[table]", context_before)
+                            context_after = (
+                                TABLE_PLACEHOLDER_RE.sub("[table]", chunker.contextualize(chunk=chunks[position + 1]))
+                                if position < len(chunks) - 1 else ""
+                            )
+                            # Summaries of the earlier tables in this same chunk (a run of consecutive tables
+                            # often has no other text around it, so they are the nearest context).
+                            earlier_summaries = "\n".join(
+                                f"Table {j+1}: {prev['summary']}"
+                                for j, prev in enumerate(table_data[:i]) if prev.get("summary")
+                            )
+                            context_parts = [
+                                ("Section Headings", ", ".join(headings)),
+                                ("Chunk Before Table", context_before),
+                                ("Earlier Tables In This Chunk (already summarized)", earlier_summaries),
+                                ("Chunk After Table", context_after),
+                            ]
+                            context_block = "".join(
+                                f"\n {label}: {value}" for label, value in context_parts if value and value.strip()
+                            )
+                            prompt_prefix = f"{prompt_prefix}{context_block}\n Table To Summarize:\n"
 
                             table_markdown = tbl["markdown"]
 
@@ -541,6 +642,11 @@ def process_single_document(file_path: Path, output_root: Path, input_root: Path
                             print(
                                 f"SUMMARY TOKEN COUNT: {count_embedding_tokens(summary)}"
                             )
+                            if summary.strip().upper().rstrip(".") == "UNREADABLE":
+                                print(f"  Table {i + 1} text is unreadable; sending its page to the vision model.")
+                                summary = vision_table_fallback(
+                                    file_unit, tbl.get("page_no"), output_subdir, i + 1
+                                ) or "(table text could not be read)"
 
                             print(f"  ✓ Table {i+1} summary generated.")
 
@@ -618,6 +724,27 @@ def process_single_document(file_path: Path, output_root: Path, input_root: Path
 
                 if has_picture:
                     print(f"  ✓ Chunk {chunk_index} contains {len(picture_refs)} picture(s): {picture_refs}")
+
+                if DESCRIBE_PICTURES and pictures:
+                    new_descriptions = []
+                    for pic, src_path in zip(pictures, picture_paths):
+                        description = describe_picture(src_path, picture_descriptions)
+                        if description:
+                            pic["description"] = description
+                            # The chunker may attach one picture to several nearby chunks; embed its text once
+                            if pic["ref"] not in described_pictures:
+                                described_pictures.add(pic["ref"])
+                                new_descriptions.append(description)
+                    if new_descriptions:
+                        vectorize_text += "".join(f"\n[Image: {d}]" for d in new_descriptions)
+                        token_count = count_embedding_tokens(vectorize_text)
+                        print(f"    Added {len(new_descriptions)} image description(s); payload now {token_count} tokens")
+
+                # Skip chunks that are effectively empty (a stray digit or mark from OCR): they only add noise
+                # to search results. Tables and pictures count as content.
+                if not has_table and not pictures and len(re.sub(r"\W", "", vectorize_text)) < 4:
+                    print(f"  Skipping chunk {chunk_index}: no meaningful content ({vectorize_text.strip()!r})")
+                    continue
 
                 # Prepare metadata for database
                 metadata = {
@@ -777,7 +904,7 @@ def main():
     if len(args) >= 2:
         # Process the given file(s)
         for doc_arg in args[1:]:
-            process_single_document(Path(doc_arg), output_root, input_root)
+            process_single_document(Path(doc_arg), output_root, input_root, reference_in_place)
         
     else:
         # Process all files recursively in input directory, one at a time

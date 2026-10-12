@@ -15,8 +15,9 @@ EMBEDDING_MODEL = os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text-v2-moe")
 # does not include. Reserve headroom so a chunk measured right at the model's
 # reported context length doesn't overflow once Ollama adds its own tokens.
 _EMBEDDING_SPECIAL_TOKEN_MARGIN = 8
+MAX_NUM_CTX = 16000  # global cap on Ollama context; never exceeds the model's own limit
 EMBEDDING_MAX_TOKENS = max(
-    1, get_model_context_length(EMBEDDING_MODEL) - _EMBEDDING_SPECIAL_TOKEN_MARGIN
+    1, min(MAX_NUM_CTX, get_model_context_length(EMBEDDING_MODEL)) - _EMBEDDING_SPECIAL_TOKEN_MARGIN
 )
 
 

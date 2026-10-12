@@ -27,6 +27,31 @@ if errorlevel 1 (
     )
 )
 
+rem The UI needs the Ollama server (embedding model lookup happens at import time)
+if not defined OLLAMA_HOST set "OLLAMA_HOST=http://localhost:11434"
+%PY% -c "import os,requests; requests.get(os.environ['OLLAMA_HOST'].rstrip('/')+'/api/tags', timeout=3)" >nul 2>&1
+if errorlevel 1 (
+    echo Ollama is not running at %OLLAMA_HOST%. Starting it ...
+    where ollama >nul 2>&1
+    if errorlevel 1 (
+        echo Ollama is not installed or not on PATH. Install it from https://ollama.com and re-run.
+        pause
+        exit /b 1
+    )
+    start "Ollama" /min ollama serve
+    set /a tries=0
+    :wait_ollama
+    timeout /t 1 /nobreak >nul
+    %PY% -c "import os,requests; requests.get(os.environ['OLLAMA_HOST'].rstrip('/')+'/api/tags', timeout=3)" >nul 2>&1
+    if errorlevel 1 (
+        set /a tries+=1
+        if %tries% lss 30 goto wait_ollama
+        echo Ollama did not start within 30 seconds.
+        pause
+        exit /b 1
+    )
+)
+
 echo Starting Vector Search UI at http://127.0.0.1:5151 ...
 rem Open the browser a few seconds after the server starts
 start "" /b cmd /c "timeout /t 3 /nobreak >nul & start http://127.0.0.1:5151"
