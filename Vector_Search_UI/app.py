@@ -815,15 +815,6 @@ def _load_pipeline_settings():
         return {}
 
 
-def _save_pipeline_settings(values, options):
-    try:
-        os.makedirs(os.path.dirname(PIPELINE_SETTINGS_FILE), exist_ok=True)
-        with open(PIPELINE_SETTINGS_FILE, "w", encoding="utf-8") as fp:
-            json.dump({"values": values, "options": options}, fp, indent=2)
-    except OSError:
-        pass  # remembering the settings is a convenience; never block a run on it
-
-
 def _ollama_host():
     host = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
     return host if host.startswith("http") else f"http://{host}"
@@ -847,6 +838,34 @@ def api_pipeline_config():
         state = _job_state("pipeline_ui")
     return jsonify({"schema": PIPELINE_SETTINGS, "saved": saved, "models": _ollama_models(), "state": state,
                     "inputs": {"count": count, "names": names[:500], "root": _inputs_root()}})
+
+
+@app.route("/api/pipeline/settings", methods=["POST"])
+def api_pipeline_save_settings():
+    """Save the page's settings; they are loaded in place of the defaults the next time the page opens."""
+    if not _request_allowed():
+        abort(403)
+    payload = request.get_json() or {}
+    values = payload.get("values") or {}
+    options = payload.get("options") or {}
+    try:
+        _pipeline_env(values)  # same validation as a run, so a saved value can never fail a later run
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    folder = str(options.get("folder") or "").strip()
+    if len(folder) > 500 or any(ord(c) < 32 for c in folder):
+        return jsonify({"error": "The folder path is not valid."}), 400
+    saved_values = {k: ("1" if v is True else "0" if v is False else str(v if v is not None else ""))
+                    for k, v in values.items() if k in _PIPELINE_ITEMS}
+    try:
+        os.makedirs(os.path.dirname(PIPELINE_SETTINGS_FILE), exist_ok=True)
+        with open(PIPELINE_SETTINGS_FILE, "w", encoding="utf-8") as fp:
+            json.dump({"values": saved_values,
+                       "options": {"folder": folder, "restart_ollama": bool(options.get("restart_ollama"))}},
+                      fp, indent=2)
+    except OSError as e:
+        return jsonify({"error": f"Could not save the settings: {e}"}), 500
+    return jsonify({"saved": True})
 
 
 @app.route("/api/pipeline/inputs")
@@ -907,8 +926,6 @@ def api_pipeline_run():
         if not os.path.isdir(folder):
             return jsonify({"error": f"Folder not found: {folder}"}), 400
         args += ["--in-place", folder]
-    if options.get("retry_failed"):
-        args.append("--retry-failed")
     if any(any(c in _CMD_METACHARS for c in a) for a in args):
         return jsonify({"error": "The folder path may not contain & | < > ^ % or line breaks."}), 400
 
@@ -927,7 +944,6 @@ def api_pipeline_run():
         except Exception as e:
             return jsonify({"error": f"Could not restart Ollama: {e}"}), 500
 
-    _save_pipeline_settings(values, {k: options.get(k) for k in ("folder", "retry_failed", "restart_ollama")})
     progress = {"total": total, "done": 0, "failed": 0, "skipped": 0, "current": None, "unit": None,
                 "started": time.time(), "partial": ""}
     return _start_job("pipeline_ui", PIPELINE_TASK, args, env_extra=env, progress=progress)

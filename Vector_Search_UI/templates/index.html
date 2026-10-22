@@ -158,6 +158,15 @@
   .pl-layout { display: flex; gap: 1.5rem; padding: 1.5rem; align-items: flex-start; }
   .pl-settings { width: 400px; flex-shrink: 0; max-height: calc(100vh - 8rem); overflow-y: auto; position: sticky; top: 6.5rem; }
   .pl-main { flex: 1; min-width: 0; }
+  .pl-savebar {
+    position: sticky; bottom: -1.25rem; margin: 1rem -1.25rem -1.25rem; padding: 0.7rem 1.25rem;
+    background: var(--panel); border-top: 1px solid var(--border); display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap;
+  }
+  .pl-savebar button { margin: 0; width: auto; padding: 0.5rem 1rem; font-size: 0.85rem; }
+  .pl-savestate { font-size: 0.78rem; color: var(--muted); }
+  .pl-savestate.dirty { color: #facc15; }
+  .pl-savestate.ok { color: var(--score); }
+  .pl-savestate.fail { color: #f87171; }
   .pl-group { border-top: 1px solid var(--border); padding: 0.3rem 0; }
   .pl-group:first-of-type { border-top: none; }
   .pl-group summary { cursor: pointer; font-weight: 600; font-size: 0.9rem; padding: 0.4rem 0; }
@@ -202,11 +211,13 @@
         <summary>Source</summary>
         <label for="plFolder">Folder to scan in place (blank = Documents\Inputs)</label>
         <input type="text" id="plFolder" placeholder="e.g. D:\Shared\Manuals">
-        <div class="pl-help">In-place mode references the originals and never moves them.</div>
-        <div class="checkbox-row"><input type="checkbox" id="plRetry"><label for="plRetry">Retry documents that failed before</label></div>
-      </details>
+        <div class="pl-help">In-place mode references the originals and never moves them.</div>      </details>
       <div id="plGroups"></div>
-      <button type="button" class="btn-tertiary" id="plReset" style="margin-top:1rem">Reset settings to defaults</button>
+      <div class="pl-savebar">
+        <button type="button" id="plSave">Save settings</button>
+        <button type="button" class="btn-tertiary" id="plReset">Reset to defaults</button>
+        <span class="pl-savestate" id="plSaveState"></span>
+      </div>
     </div>
     <div class="pl-main">
       <div class="pl-controls task-actions" style="margin-top:0">
@@ -807,7 +818,6 @@ async function loadPipeline() {
   setSettingValues(saved.values);
   const opts = saved.options || {};
   $("plFolder").value = opts.folder || "";
-  $("plRetry").checked = !!opts.retry_failed;
   if ($("plRestart")) $("plRestart").checked = !!opts.restart_ollama;
   $("plModels").innerHTML = (data.models || []).map(m => `<option value="${escapeHtml(m)}">`).join("");
   pl.loaded = true;
@@ -845,7 +855,7 @@ function renderProgress(state) {
   fill.style.width = pct + "%";
   $("plCount").textContent = `${finished} / ${p.total} documents`;
   $("plPct").textContent = pct + "%";
-  $("plBreakdown").textContent = `${p.done} done · ${p.failed} failed · ${p.skipped} skipped earlier`;
+  $("plBreakdown").textContent = `${p.done} done · ${p.failed} failed`;
   $("plElapsed").textContent = "elapsed " + fmtElapsed(p.elapsed);
   if (state.running) {
     $("plCurrent").textContent = p.current ? `Now: ${p.current}${p.unit ? "  —  " + p.unit : ""}` : "Starting…";
@@ -916,7 +926,7 @@ $("plStart").addEventListener("click", async () => {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         values: collectSettings(),
-        options: { folder: $("plFolder").value.trim(), retry_failed: $("plRetry").checked, restart_ollama: restart },
+        options: { folder: $("plFolder").value.trim(), restart_ollama: restart },
       }),
     });
   } catch (err) {
@@ -942,7 +952,48 @@ $("plStop").addEventListener("click", async () => {
   await fetch("/api/pipeline/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
 });
 $("plClear").addEventListener("click", () => { pl.text = ""; $("plConsole").textContent = ""; });
-$("plReset").addEventListener("click", () => setSettingValues({}));
+$("plReset").addEventListener("click", () => {
+  setSettingValues({});
+  $("plFolder").value = "";
+  if ($("plRestart")) $("plRestart").checked = false;
+  markSettings("dirty");
+  refreshInputs();
+});
+
+function markSettings(state) {
+  const el = $("plSaveState");
+  el.className = "pl-savestate " + (state || "");
+  el.textContent = state === "dirty" ? "Unsaved changes" : state === "ok" ? "Saved" : "";
+}
+// Any edit in the settings panel (inputs, selects, checkboxes) leaves it differing from what is saved.
+$("plSettings").addEventListener("input", () => markSettings("dirty"));
+$("plSettings").addEventListener("change", () => markSettings("dirty"));
+
+$("plSave").addEventListener("click", async () => {
+  const el = $("plSaveState");
+  let resp;
+  try {
+    resp = await fetch("/api/pipeline/settings", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        values: collectSettings(),
+        options: { folder: $("plFolder").value.trim(), restart_ollama: !!($("plRestart") && $("plRestart").checked) },
+      }),
+    });
+  } catch (err) {
+    el.className = "pl-savestate fail";
+    el.textContent = "Save failed: " + err;
+    return;
+  }
+  if (!resp.ok) {
+    let msg = resp.statusText;
+    try { msg = (await resp.json()).error || msg; } catch (e) {}
+    el.className = "pl-savestate fail";
+    el.textContent = "Not saved: " + msg;
+    return;
+  }
+  markSettings("ok");
+});
 
 loadDocumentList();
 $("query").addEventListener("keydown", (e) => {

@@ -2,19 +2,16 @@
 Crash-proof driver for Document_To_Database_Pipeline_Ollama.py.
 
 Runs the pipeline once per document, each in its own Python process, so a hard crash (CUDA/host out of
-memory, std::bad_alloc, a model server dying, ...) only costs that one document: it is recorded as failed
-and the run moves on to the next. Already-ingested documents are skipped by the pipeline itself, so the
-run can be repeated safely.
+memory, std::bad_alloc, a model server dying, ...) only costs that attempt: it is reported as failed and
+the run moves on to the next document. Nothing is skipped: failed or interrupted documents are tried again
+on the next run, and the pipeline itself resumes a partly ingested document where it stopped.
 
-State lives in Documents/Working Directory/_resilient_state.json:
-  - failed documents are skipped on later runs (use --retry-failed to try them again)
-  - if the whole run dies hard (power loss, killed console), the document that was in progress is marked
-    failed on the next start instead of being retried forever
+State lives in Documents/Working Directory/_resilient_state.json (the document in progress and this run's
+failures, for the end-of-run report).
 
 Usage:
     Run_Pipeline_Resilient.py                       everything in Documents/Inputs
     Run_Pipeline_Resilient.py --in-place FOLDER     scan FOLDER, reference the originals (no copies)
-    Run_Pipeline_Resilient.py --retry-failed        also retry documents that failed before
 """
 import json
 import os
@@ -85,7 +82,6 @@ def iter_documents(folder):
 def main(argv):
     global monitor
     monitor = Pipeline_Logging.start("pipeline_run")
-    retry_failed = "--retry-failed" in argv
     in_place_dir = None
     if "--in-place" in argv:
         idx = argv.index("--in-place")
@@ -101,29 +97,21 @@ def main(argv):
         print(f"Input folder not found: {root}")
         return 2
 
+    # Nothing is ever skipped: documents that failed or were interrupted in an earlier run are tried again.
     state = load_state()
     if state["in_progress"]:
-        stuck = state["in_progress"]
-        print(f"The previous run died while processing:\n  {stuck}\nMarking it as failed and skipping it.\n")
-        state["failed"][stuck] = {"reason": "previous run died while processing this document",
-                                  "time": time.strftime("%Y-%m-%d %H:%M:%S")}
+        print(f"The previous run died while processing:\n  {state['in_progress']}\nIt will be retried.\n")
         state["in_progress"] = None
-        save_state(state)
-    if retry_failed:
-        state["failed"] = {}
-        save_state(state)
+    state["failed"] = {}
+    save_state(state)
 
     print(f"Processing documents under {root}, one at a time, starting at the top folder.", flush=True)
-    done = skipped = seen = 0
+    done = seen = 0
     failed_now = []
     for doc in iter_documents(root):
         seen += 1
         number = seen
         key = str(doc)
-        if key in state["failed"]:
-            print(f"[#{number}] Skipping (failed earlier: {state['failed'][key]['reason']}): {doc.name}")
-            skipped += 1
-            continue
 
         print(f"\n{'=' * 70}\n[#{number}] {doc}\n{'=' * 70}", flush=True)
         state["in_progress"] = key
@@ -161,19 +149,19 @@ def main(argv):
 
         state["in_progress"] = None
         if code != 0:
-            print(f"\n!!! Crashed (exit code {code}); skipping {doc.name} and continuing.", flush=True)
+            print(f"\n!!! Crashed (exit code {code}); continuing with the next document. {doc.name} is retried on the next run.", flush=True)
             state["failed"][key] = {"reason": f"exit code {code}", "time": time.strftime("%Y-%m-%d %H:%M:%S")}
             failed_now.append(doc)
         else:
             done += 1
         save_state(state)
 
-    print(f"\n{'=' * 70}\nFinished. Documents seen: {seen}. Completed: {done}, skipped (failed earlier): {skipped}, crashed this run: {len(failed_now)}")
+    print(f"\n{'=' * 70}\nFinished. Documents seen: {seen}. Completed: {done}, crashed this run: {len(failed_now)}")
     if state["failed"]:
         print("Documents that failed (not ingested, or only partly):")
         for path, info in state["failed"].items():
             print(f"  - {path}  [{info['reason']}]")
-        print("Run with --retry-failed to try them again.")
+        print("They stay in Inputs and are tried again on the next run.")
     return 0
 
 

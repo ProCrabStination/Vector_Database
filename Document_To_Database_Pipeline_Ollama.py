@@ -586,6 +586,7 @@ def process_single_document(file_path: Path, output_root: Path, input_root: Path
                                 "Write a detailed summary of this table using the surrounding context to provide a comprehensive overview."
                                 "Do not copy the table row by row, "
                                 "and use only what the table itself says, and do not make up anything."
+                                "Do not note any discrepancies or misspellings or formatting issues, keep your remarks to only what is in the table."
                             )
 
                             # Use the previous/next chunk's text as surrounding context
