@@ -1,5 +1,5 @@
 /Documents
 /vec_store
 /logs
-/__pycache__
-/Vector_Search_UI/__pycache__
+__pycache__/
+*.pyc
