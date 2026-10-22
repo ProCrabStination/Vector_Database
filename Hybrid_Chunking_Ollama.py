@@ -193,11 +193,6 @@ def chunk_doclingdocument(doc: DoclingDocument, image_base_path: Optional[Path] 
     chunk_iter = chunker.chunk(dl_doc=doc)
     chunks = list(chunk_iter)
 
-    MAX_CHUNKS = 1000
-    if len(chunks) > MAX_CHUNKS:
-        print(f"Shortening document because it has {len(chunks)} chunks (>{MAX_CHUNKS})")
-        return chunks[1000:]  # Skip this document
-    
     # Post-process chunks to add back picture references that may have been filtered out
     # Build a map of all pictures in the document
     picture_map = {}

@@ -23,6 +23,9 @@ import sys
 import time
 from pathlib import Path
 
+import Pipeline_Logging
+
+monitor = None  # set by main()
 REPO_ROOT = Path(__file__).resolve().parent
 PIPELINE = REPO_ROOT / "Document_To_Database_Pipeline_Ollama.py"
 WORKING_DIR = REPO_ROOT / "Documents" / "Working Directory"
@@ -80,6 +83,8 @@ def iter_documents(folder):
 
 
 def main(argv):
+    global monitor
+    monitor = Pipeline_Logging.start("pipeline_run")
     retry_failed = "--retry-failed" in argv
     in_place_dir = None
     if "--in-place" in argv:
@@ -124,19 +129,35 @@ def main(argv):
         state["in_progress"] = key
         save_state(state)
 
-        cmd = [sys.executable, str(PIPELINE)]
+        cmd = [sys.executable, "-X", "faulthandler", str(PIPELINE)]
         if in_place_dir:
             cmd += ["--in-place", str(in_place_dir)]
         cmd.append(key)
-        env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
+        # PIPELINE_LOGGING_ACTIVE tells the child this driver already tees the console and monitors resources.
+        env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8", "PIPELINE_LOGGING_ACTIVE": "1"}
+        monitor.mark(f"doc start #{number}: {doc.name}")
+        started = time.time()
+        proc = None
         try:
-            code = subprocess.run(cmd, cwd=str(REPO_ROOT), env=env).returncode
+            # The child's stdout+stderr (including any faulthandler dump) is relayed line by line through
+            # this process, so it lands in the log file as well as on the console.
+            proc = subprocess.Popen(cmd, cwd=str(REPO_ROOT), env=env, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+            for line in proc.stdout:
+                sys.stdout.write(line)
+            code = proc.wait()
         except KeyboardInterrupt:
             # Deliberate stop by the user: not a crash, so the document is not marked failed.
+            if proc is not None:
+                proc.kill()
             state["in_progress"] = None
             save_state(state)
             print("\nStopped by user.")
             return 130
+
+        peaks = monitor.mark(f"doc end #{number}: {doc.name} exit={code}")
+        print(f"[#{number}] finished in {time.time() - started:.0f}s with exit code {code} "
+              f"(0x{code & 0xFFFFFFFF:08X}); {Pipeline_Logging.format_peaks(peaks)}", flush=True)
 
         state["in_progress"] = None
         if code != 0:

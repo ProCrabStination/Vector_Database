@@ -22,6 +22,7 @@ numpy
 pandas
 faiss-cpu
 requests
+psutil          # Pipeline_Logging.py resource monitor
 ollama
 transformers
 annotated-types

@@ -67,7 +67,8 @@ pdf_pipeline_options.accelerator_options = accelerator_options
 # generate_picture_images is intentionally on despite that OOM risk: picture
 # crops are needed for the search UI. If large PDFs start blowing up again,
 # lower images_scale and/or page_batch_size before disabling this again.
-pdf_pipeline_options.images_scale = 3.0
+DOCLING_IMAGES_SCALE = float(os.getenv("DOCLING_IMAGES_SCALE", "3.0"))
+pdf_pipeline_options.images_scale = DOCLING_IMAGES_SCALE
 pdf_pipeline_options.generate_picture_images = True
 pdf_pipeline_options.do_table_structure = True
 pdf_pipeline_options.generate_table_images = False
@@ -108,7 +109,7 @@ pdf_pipeline_options.allow_external_plugins = True
 # oversized pages (e.g. engineering drawings) can otherwise exhaust host RAM and
 # raise `std::bad_alloc` during the preprocess stage. Processing one page at a
 # time keeps peak memory to a single rasterized page.
-docling_settings.perf.page_batch_size = 5
+docling_settings.perf.page_batch_size = int(os.getenv("DOCLING_PAGE_BATCH_SIZE", "5"))
 
 
 # Initialize DocumentConverter with format-specific options
@@ -119,7 +120,7 @@ doc_converter = DocumentConverter(
         InputFormat.IMAGE: ImageFormatOption(pipeline_options=pdf_pipeline_options),
         InputFormat.DOCX: WordFormatOption(
             pipeline_options=PdfPipelineOptions(  # Word uses same pipeline options as PDF
-                images_scale=3.0,
+                images_scale=DOCLING_IMAGES_SCALE,
                 generate_picture_images=True,
                 do_table_structure=True,
                 accelerator_options=accelerator_options,
@@ -127,7 +128,7 @@ doc_converter = DocumentConverter(
         ),
         InputFormat.PPTX: PowerpointFormatOption(
             pipeline_options=PdfPipelineOptions(  # PowerPoint uses same pipeline options as PDF
-                images_scale=3.0,
+                images_scale=DOCLING_IMAGES_SCALE,
                 generate_picture_images=True,
                 do_table_structure=True,
                 accelerator_options=accelerator_options,
@@ -741,7 +742,7 @@ def process_pdf(pdf_path, doc_output_dir):
         except Exception as e:
             logging.warning(f"✗ Could not load cached JSON for {pdf_file.name} ({type(e).__name__}); reconverting.")
 
-    conv_res = doc_converter.convert(str(pdf_file))
+    conv_res = convert_with_docling(pdf_file)
 
     # Save the document as JSON so future runs can skip reconversion.
     try:
@@ -863,7 +864,7 @@ def process_non_pdf(input_path, doc_output_dir):
     
     # If loading failed or file doesn't exist, convert the document
     if conv_res is None:
-        conv_res = doc_converter.convert(str(input_file))
+        conv_res = convert_with_docling(input_file)
         logging.info(f"✓ Converted {input_file.name} to DoclingDocument")
 
         # Save the document as JSON using model_dump_json
@@ -918,17 +919,123 @@ def process_non_pdf(input_path, doc_output_dir):
     return conv_res
 
 
+def unload_ollama_models():
+    """Unload every model Ollama currently has loaded (keep_alive=0) so Docling gets the VRAM."""
+    import requests
+
+    host = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+    if host.endswith("/v1"):
+        host = host[:-3]
+    if not host.startswith("http"):
+        host = f"http://{host}"
+    try:
+        loaded = requests.get(f"{host}/api/ps", timeout=10).json().get("models", [])
+        for m in loaded:
+            name = m.get("name") or m.get("model")
+            if name:
+                requests.post(f"{host}/api/generate", json={"model": name, "keep_alive": 0}, timeout=60)
+                logging.info(f"Unloaded Ollama model {name} before Docling conversion.")
+    except Exception as e:
+        logging.warning(f"Could not unload Ollama models: {e}")
+
+
+def release_docling_models():
+    """Drop Docling's cached pipelines (layout/table/OCR models) and free their GPU memory.
+
+    Docling keeps every initialized pipeline in doc_converter.initialized_pipelines for the life of
+    the process, so its models hold VRAM that Ollama then can't use. The next convert() rebuilds
+    the pipeline, which costs a few seconds of model loading per file.
+    """
+    import gc
+
+    doc_converter.initialized_pipelines.clear()
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+    except Exception as e:
+        logging.warning(f"Could not empty CUDA cache: {e}")
+
+
+def convert_with_docling(input_file):
+    """doc_converter.convert() with Ollama's models unloaded first and Docling's released right after.
+
+    Releasing here (not at the end of process_file) frees the VRAM before the Ollama vision calls that
+    follow conversion. Returns the ConversionResult, which holds no model references.
+    """
+    unload_ollama_models()
+    try:
+        return doc_converter.convert(str(input_file))
+    finally:
+        release_docling_models()
+
+
+class LoadedDocument:
+    """Stands in for Docling's ConversionResult when the conversion ran in another process: callers only use .document."""
+
+    def __init__(self, document):
+        self.document = document
+
+
+def _process_file_in_subprocess(input_file, output_root):
+    """Run the conversion in a short-lived child process and load its DoclingDocument from the saved JSON.
+
+    A process that has used CUDA keeps its CUDA context and allocator memory until it exits, which
+    empty_cache() can't give back. Ollama needs that VRAM for the summary/vision models, so the
+    conversion runs in a child that exits as soon as it is done.
+    """
+    import subprocess
+    import sys
+
+    cmd = [sys.executable, "-X", "faulthandler", str(Path(__file__).resolve()),
+           "--convert-one", str(input_file), str(output_root)]
+    env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
+    # Relay the child's output line by line so it reaches this process's console and log tee.
+    proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, encoding="utf-8", errors="replace")
+    for line in proc.stdout:
+        sys.stdout.write(line)
+    code = proc.wait()
+    if code != 0:
+        raise RuntimeError(f"Docling conversion process for {input_file.name} exited with code {code}")
+
+    json_path = Path(output_root) / input_file.stem / f"{input_file.stem}_DoclingDocument.json"
+    if not json_path.is_file():
+        return None  # the child skipped the file (e.g. not found) and wrote nothing
+    return LoadedDocument(DoclingDocument.model_validate_json(json_path.read_text(encoding="utf-8")))
+
+
 def process_file(input_path, output_root):
- 
+    """Convert one document; returns an object with .document (None on failure, False for Office temp files).
+
+    Converts in a child process by default; set DOCLING_SUBPROCESS=0 to convert in this process instead.
+    """
     input_file = Path(input_path)
-    
+    if input_file.name.startswith('~$'):
+        logging.info(f"Skipping temporary Office file: {input_file}")
+        return False
+
+    if os.getenv("DOCLING_SUBPROCESS", "1").strip().lower() in ("0", "false", "no", "off"):
+        try:
+            return _process_file(input_file, Path(output_root))
+        finally:
+            release_docling_models()
+    return _process_file_in_subprocess(input_file, Path(output_root))
+
+
+def _process_file(input_path, output_root):
+
+    input_file = Path(input_path)
+
     # Skip temporary Office files (start with ~$)
     if input_file.name.startswith('~$'):
         logging.info(f"Skipping temporary Office file: {input_file}")
         return False
-    
+
     ext = get_file_extension(input_file)
-    
+
     if ext in PDF_EXTENSIONS:
 
         convert_res = process_pdf(str(input_file), output_root / input_file.stem)
@@ -939,9 +1046,9 @@ def process_file(input_path, output_root):
     elif is_supported_file(input_file):
 
         convert_res = process_non_pdf(str(input_file), output_root / input_file.stem)
-        
+
         return convert_res
-        
+
 def main():
 
     # Create log file in the output directory
@@ -1002,4 +1109,10 @@ def main():
     logging.info("Processing complete.")
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    if len(sys.argv) == 4 and sys.argv[1] == "--convert-one":
+        # Worker mode, started by _process_file_in_subprocess: convert one file, then exit to free all VRAM.
+        _process_file(sys.argv[2], Path(sys.argv[3]))
+    else:
+        main()

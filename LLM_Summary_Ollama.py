@@ -25,10 +25,23 @@ DEFAULT_SETUP = (""
 )
 
 SUMMARY_MODEL = os.getenv("AI_SUMMARY_MODEL", "qwen3-vl:4b-instruct")
-MAX_NUM_CTX = 16000  # cap on Ollama num_ctx for all requests
+MAX_NUM_CTX = int(os.getenv("AI_SUMMARY_NUM_CTX", "8192"))  # cap on Ollama num_ctx for all requests (KV cache memory scales with this)
+MAX_NUM_PREDICT = int(os.getenv("AI_SUMMARY_MAX_PREDICT", "1024"))  # summaries are ~80-150 words; don't reserve output room for the whole window
+KEEP_ALIVE = os.getenv("AI_SUMMARY_KEEP_ALIVE", "5m")  # how long Ollama keeps the model loaded after a request
 SUMMARY_MODEL_MAX_INPUT_TOKENS = min(MAX_NUM_CTX, get_model_context_length(SUMMARY_MODEL))
 # None = never time out (requests waits indefinitely for Ollama).
 SUMMARY_REQUEST_TIMEOUT = None
+
+
+def print_ollama_ps(label=""):
+    """Print the output of `ollama ps` (loaded models, size, CPU/GPU split, context) to the console."""
+    import subprocess
+
+    try:
+        result = subprocess.run(["ollama", "ps"], capture_output=True, text=True, timeout=15)
+        print(f"\n[ollama ps]{' ' + label if label else ''}\n{(result.stdout or result.stderr).rstrip()}\n", flush=True)
+    except Exception as e:
+        print(f"Could not run 'ollama ps': {e}")
 
 
 def _normalize_ollama_host(api_host: str) -> str:
@@ -72,7 +85,8 @@ def ask_vision_model(image_path, prompt):
                 response = client.chat(
                     model=model,
                     messages=[{"role": "user", "content": prompt, "images": [image_bytes]}],
-                    options={"temperature": 0.1, "num_ctx": SUMMARY_MODEL_MAX_INPUT_TOKENS},
+                    options={"temperature": 0.1, "num_ctx": SUMMARY_MODEL_MAX_INPUT_TOKENS, "num_predict": MAX_NUM_PREDICT * 2},
+                    keep_alive=KEEP_ALIVE,
                 )
                 content = response["message"]["content"] if isinstance(response, dict) else response.message.content
                 if content and content.strip():
@@ -144,7 +158,7 @@ def summarize_text(prompt, max_tokens=128000, image_paths=None, setup=None, temp
                 print(f"Error loading image {image_path}: {e}")
 
     try:
-        num_predict = max(32, min(int(max_tokens), SUMMARY_MODEL_MAX_INPUT_TOKENS))
+        num_predict = max(32, min(int(max_tokens), MAX_NUM_PREDICT, SUMMARY_MODEL_MAX_INPUT_TOKENS))
 
         user_message = {
             "role": "user",
@@ -161,7 +175,7 @@ def summarize_text(prompt, max_tokens=128000, image_paths=None, setup=None, temp
             ],
             "stream": False,
             "think": False,
-            "keep_alive": "30m",
+            "keep_alive": KEEP_ALIVE,
             "options": {
                 "temperature": temperature,
                 "num_predict": num_predict,

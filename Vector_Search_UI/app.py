@@ -16,6 +16,7 @@ import shlex
 import subprocess
 import sys
 import threading
+import time
 import traceback
 
 from urllib.parse import quote
@@ -479,17 +480,25 @@ def _pump_output(job):
         text = decoder.decode(chunk)
         with _jobs_lock:
             job["output"] += text
+            _feed_progress(job, text)
     with _jobs_lock:
         job["output"] += decoder.decode(b"", final=True)
         job["exit_code"] = job["proc"].wait()
+        if job.get("progress"):
+            job["progress"]["ended"] = time.time()
 
 
 def _job_state(task_id):
     job = _jobs.get(task_id)
     if not job:
         return {"running": False, "job_id": None, "exit_code": None}
-    return {"running": job["exit_code"] is None, "job_id": job["id"], "exit_code": job["exit_code"],
-            "command": job["command"]}
+    state = {"running": job["exit_code"] is None, "job_id": job["id"], "exit_code": job["exit_code"],
+             "command": job["command"]}
+    progress = job.get("progress")
+    if progress:
+        state["progress"] = {k: v for k, v in progress.items() if k not in ("started", "ended", "partial")}
+        state["progress"]["elapsed"] = round((progress.get("ended") or time.time()) - progress["started"])
+    return state
 
 
 @app.route("/api/tasks")
@@ -521,11 +530,19 @@ def _task_running(task_id):
         return task_id in _jobs and _jobs[task_id]["exit_code"] is None
 
 
-def _start_job(task_id, task, args):
+# Tasks that write to the same database/working folder and so must not run at the same time.
+_INGEST_TASKS = {"pipeline", "pipeline_in_place", "pipeline_ui"}
+
+
+def _start_job(task_id, task, args, env_extra=None, progress=None):
     with _jobs_lock:
         if task_id in _jobs and _jobs[task_id]["exit_code"] is None:
             return jsonify({"error": "This task is already running."}), 409
-        env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
+        if task_id in _INGEST_TASKS:
+            busy = [t for t in _INGEST_TASKS if t in _jobs and _jobs[t]["exit_code"] is None]
+            if busy:
+                return jsonify({"error": f"Another ingest is already running ({busy[0]}); stop it first."}), 409
+        env = {**os.environ, **(env_extra or {}), "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
         # stdin is closed so the trailing "pause" in each .bat returns immediately instead of hanging.
         proc = subprocess.Popen(
             ["cmd.exe", "/c", os.path.join(REPO_ROOT, task["bat"]), *args], cwd=REPO_ROOT, env=env,
@@ -533,7 +550,7 @@ def _start_job(task_id, task, args):
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
         job = {"id": next(_job_counter), "proc": proc, "output": "", "exit_code": None,
-               "command": subprocess.list2cmdline([task["bat"], *args])}
+               "command": subprocess.list2cmdline([task["bat"], *args]), "progress": progress}
         _jobs[task_id] = job
     threading.Thread(target=_pump_output, args=(job,), daemon=True).start()
     return jsonify({"job_id": job["id"], "command": job["command"]})
@@ -629,6 +646,316 @@ def api_task_stop(task_id):
     # Kill the whole tree (cmd -> python), not just the cmd.exe wrapper.
     subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True,
                    creationflags=subprocess.CREATE_NO_WINDOW)
+    return jsonify({"stopped": True})
+
+
+# ---------------------------------------------------------------------------
+# Pipeline page: edit the pipeline's settings, start it, and follow progress + console output.
+# The settings are environment variables read by the pipeline scripts (see each script's os.getenv calls).
+# ---------------------------------------------------------------------------
+PIPELINE_TASK = {"id": "pipeline_ui", "bat": "Run_Pipeline_Resilient.bat"}
+PIPELINE_SETTINGS_FILE = os.path.join(vdb.DOCS_ROOT, "Working Directory", "_ui_pipeline_settings.json")
+PIPELINE_RESILIENT_STATE = os.path.join(vdb.DOCS_ROOT, "Working Directory", "_resilient_state.json")
+# Mirrors Run_Pipeline_Resilient.SUPPORTED (not imported: it pulls in the monitoring modules).
+PIPELINE_EXTENSIONS = {
+    ".doc", ".docx", ".rtf", ".odt", ".csv", ".ods",
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp",
+    ".ppt", ".pptx", ".odp", ".pdf",
+}
+
+# type: text | number | select | bool.  Blank optional settings (default "") are not passed, so the script default applies.
+# scope "server" settings are read by the Ollama server itself, so they only take effect when Ollama is restarted.
+PIPELINE_SETTINGS = [
+    {"group": "Models", "items": [
+        {"env": "AI_SUMMARY_MODEL", "label": "Summary model", "type": "text", "default": "qwen3-vl:4b-instruct",
+         "models": True, "help": "Writes table summaries. Also the fallback vision model."},
+        {"env": "AI_VISION_MODEL", "label": "Vision model (optional)", "type": "text", "default": "", "models": True,
+         "help": "Describes pictures and pages. Blank = use the summary model."},
+        {"env": "OLLAMA_EMBEDDING_MODEL", "label": "Embedding model", "type": "text",
+         "default": "nomic-embed-text-v2-moe", "models": True,
+         "help": "Changing this after documents are ingested makes new vectors incompatible with the old ones."},
+        {"env": "OLLAMA_HOST", "label": "Ollama host", "type": "text", "default": "http://localhost:11434"},
+        {"env": "AI_VISION_HOST", "label": "Vision host", "type": "text", "default": "http://localhost:11434"},
+    ]},
+    {"group": "Memory and context", "items": [
+        {"env": "AI_SUMMARY_NUM_CTX", "label": "Context window (tokens)", "type": "number", "int": True,
+         "default": "8192", "min": 1024, "max": 131072, "step": 512,
+         "help": "Caps the summary/vision model's context. The KV cache memory grows with this."},
+        {"env": "AI_SUMMARY_MAX_PREDICT", "label": "Max output tokens", "type": "number", "int": True,
+         "default": "1024", "min": 32, "max": 32768, "step": 64},
+        {"env": "AI_SUMMARY_KEEP_ALIVE", "label": "Keep model loaded for", "type": "text", "default": "5m",
+         "help": "Ollama duration, e.g. 30s, 5m, 1h. Docling unloads Ollama's models before each conversion anyway."},
+        {"env": "DOCLING_SUBPROCESS", "label": "Convert in a separate process", "type": "bool", "default": "1",
+         "help": "Frees all of Docling's VRAM after every conversion, at a few seconds per unit."},
+    ]},
+    {"group": "Docling conversion", "items": [
+        {"env": "DOCLING_OCR_ENGINE", "label": "OCR engine", "type": "select", "default": "easyocr",
+         "choices": ["easyocr", "rapidocr", "auto", "tesseract"]},
+        {"env": "DOCLING_FULL_PAGE_OCR", "label": "OCR every page (replace the PDF's text layer)", "type": "bool",
+         "default": "1"},
+        {"env": "DOCLING_IMAGES_SCALE", "label": "Page render scale", "type": "number", "default": "3.0",
+         "min": 0.5, "max": 4, "step": 0.25, "help": "1.0 = 72 DPI. Memory grows with the square of this."},
+        {"env": "DOCLING_PAGE_BATCH_SIZE", "label": "Pages per batch", "type": "number", "int": True,
+         "default": "5", "min": 1, "max": 64},
+        {"env": "AI_VISION_MIN_TILES", "label": "Minimum tiles per schematic page", "type": "number", "int": True,
+         "default": "6", "min": 1, "max": 64},
+    ]},
+    {"group": "Pipeline", "items": [
+        {"env": "PIPELINE_DESCRIBE_PICTURES", "label": "Describe pictures with the vision model", "type": "bool",
+         "default": "1"},
+        {"env": "PIPELINE_CLEAN_PDF", "label": "Clean PDFs before OCR (deskew)", "type": "bool", "default": "1"},
+        {"env": "PIPELINE_CLEAN_PDF_DEEP", "label": "Deep clean with unpaper", "type": "bool", "default": "0"},
+        {"env": "PIPELINE_EMBED_BATCH_SIZE", "label": "Embedding batch size", "type": "number", "int": True,
+         "default": "20", "min": 1, "max": 256},
+        {"env": "PIPELINE_MONITOR_INTERVAL", "label": "Resource monitor interval (seconds)", "type": "number",
+         "default": "2", "min": 0.5, "max": 300, "step": 0.5},
+    ]},
+    {"group": "Ollama server", "note": "Read by Ollama at startup: tick \"Restart Ollama\" below for these to apply.",
+     "items": [
+        {"env": "OLLAMA_FLASH_ATTENTION", "label": "Flash attention", "type": "select", "default": "", "scope": "server",
+         "choices": ["", "1", "0"], "choice_labels": ["(leave as is)", "on", "off"]},
+        {"env": "OLLAMA_KV_CACHE_TYPE", "label": "KV cache type", "type": "select", "default": "", "scope": "server",
+         "choices": ["", "f16", "q8_0", "q4_0"], "choice_labels": ["(leave as is)", "f16", "q8_0 (about half the memory)", "q4_0"],
+         "help": "Quantized types need flash attention on."},
+        {"env": "OLLAMA_MAX_LOADED_MODELS", "label": "Max models loaded at once", "type": "number", "int": True,
+         "default": "", "min": 1, "max": 16, "scope": "server"},
+        {"env": "OLLAMA_NUM_PARALLEL", "label": "Parallel requests per model", "type": "number", "int": True,
+         "default": "", "min": 1, "max": 16, "scope": "server", "help": "Each extra slot multiplies the KV cache; 1 is lightest."},
+    ]},
+]
+_PIPELINE_ITEMS = {i["env"]: i for g in PIPELINE_SETTINGS for i in g["items"]}
+
+
+def _pipeline_env(values):
+    """Validate the posted settings; returns (pipeline_env, server_env) as dicts of strings."""
+    env, server_env = {}, {}
+    for key, item in _PIPELINE_ITEMS.items():
+        raw = values.get(key, item["default"])
+        if isinstance(raw, bool):
+            raw = "1" if raw else "0"
+        raw = str(raw if raw is not None else "").strip()
+        if raw == "":
+            raw = item["default"]
+        if raw == "":
+            continue
+        if any(ord(c) < 32 for c in raw) or len(raw) > 300:
+            raise ValueError(f"\"{item['label']}\" has an invalid value.")
+        kind = item["type"]
+        if kind == "bool" and raw not in ("0", "1"):
+            raise ValueError(f"\"{item['label']}\" must be on or off.")
+        if kind == "select" and raw not in item["choices"]:
+            raise ValueError(f"\"{item['label']}\" must be one of: {', '.join(c or '(blank)' for c in item['choices'])}.")
+        if kind == "number":
+            try:
+                number = int(raw) if item.get("int") else float(raw)
+            except ValueError:
+                raise ValueError(f"\"{item['label']}\" must be a number.")
+            if not item["min"] <= number <= item["max"]:
+                raise ValueError(f"\"{item['label']}\" must be between {item['min']} and {item['max']}.")
+            raw = str(number)
+        (server_env if item.get("scope") == "server" else env)[key] = raw
+    return env, server_env
+
+
+def _scan_documents(root):
+    """(count, relative names) of the documents the pipeline would pick up under root."""
+    names = []
+    for dirpath, _dirs, files in os.walk(root):
+        for name in files:
+            if not name.startswith("~") and os.path.splitext(name)[1].lower() in PIPELINE_EXTENSIONS:
+                names.append(os.path.relpath(os.path.join(dirpath, name), root))
+    names.sort(key=str.lower)
+    return len(names), names
+
+
+def _inputs_root(folder=""):
+    return folder or os.path.join(vdb.DOCS_ROOT, vdb.INPUTS_DIR_NAME)
+
+
+_RE_DOC_START = re.compile(r"^\[#(\d+)\] (?!finished|Skipping)(.+?)\s*$")
+_RE_DOC_END = re.compile(r"^\[#(\d+)\] finished in \d+s with exit code (-?\d+)")
+_RE_DOC_SKIPPED = re.compile(r"^\[#(\d+)\] Skipping \(failed earlier")
+_RE_UNIT = re.compile(r"^Processing file: (.+?)\s*$")
+
+
+def _feed_progress(job, text):
+    """Update the job's document counters from Run_Pipeline_Resilient's output (called with _jobs_lock held)."""
+    progress = job.get("progress")
+    if progress is None:
+        return
+    lines = (progress["partial"] + text).replace("\r", "\n").split("\n")
+    progress["partial"] = lines.pop()  # an incomplete last line waits for the rest of its text
+    for line in lines:
+        if line.startswith("[#"):
+            m = _RE_DOC_END.match(line)
+            if m:
+                progress["done" if int(m.group(2)) == 0 else "failed"] += 1
+                progress["current"] = None
+                progress["unit"] = None
+                continue
+            if _RE_DOC_SKIPPED.match(line):
+                progress["skipped"] += 1
+                continue
+            m = _RE_DOC_START.match(line)
+            if m:
+                progress["current"] = os.path.basename(m.group(2))
+                progress["unit"] = None
+        elif line.startswith("Processing file: "):
+            m = _RE_UNIT.match(line)
+            if m:
+                progress["unit"] = os.path.basename(m.group(1))
+
+
+def _load_pipeline_settings():
+    try:
+        with open(PIPELINE_SETTINGS_FILE, encoding="utf-8") as fp:
+            saved = json.load(fp)
+        return saved if isinstance(saved, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_pipeline_settings(values, options):
+    try:
+        os.makedirs(os.path.dirname(PIPELINE_SETTINGS_FILE), exist_ok=True)
+        with open(PIPELINE_SETTINGS_FILE, "w", encoding="utf-8") as fp:
+            json.dump({"values": values, "options": options}, fp, indent=2)
+    except OSError:
+        pass  # remembering the settings is a convenience; never block a run on it
+
+
+def _ollama_host():
+    host = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+    return host if host.startswith("http") else f"http://{host}"
+
+
+def _ollama_models():
+    """Model names Ollama has installed (for the model fields' suggestions); [] if Ollama isn't reachable."""
+    import requests
+    try:
+        tags = requests.get(f"{_ollama_host()}/api/tags", timeout=2).json().get("models", [])
+        return sorted(m.get("name") for m in tags if m.get("name"))
+    except Exception:
+        return []
+
+
+@app.route("/api/pipeline/config")
+def api_pipeline_config():
+    saved = _load_pipeline_settings()
+    count, names = _scan_documents(_inputs_root())
+    with _jobs_lock:
+        state = _job_state("pipeline_ui")
+    return jsonify({"schema": PIPELINE_SETTINGS, "saved": saved, "models": _ollama_models(), "state": state,
+                    "inputs": {"count": count, "names": names[:500], "root": _inputs_root()}})
+
+
+@app.route("/api/pipeline/inputs")
+def api_pipeline_inputs():
+    folder = (request.args.get("folder") or "").strip()
+    if folder:
+        if request.remote_addr not in ("127.0.0.1", "::1"):
+            abort(403)  # other machines on the LAN may not probe arbitrary folders of this PC
+        if not os.path.isdir(folder):
+            return jsonify({"error": "Folder not found."}), 400
+    count, names = _scan_documents(_inputs_root(folder))
+    return jsonify({"count": count, "names": names[:500], "root": _inputs_root(folder)})
+
+
+def _restart_ollama(server_env):
+    """Restart Ollama with server_env added to its environment, then wait until it answers."""
+    import requests
+    for image in ("ollama app.exe", "ollama.exe"):
+        subprocess.run(["taskkill", "/F", "/T", "/IM", image], capture_output=True,
+                       creationflags=subprocess.CREATE_NO_WINDOW)
+    time.sleep(3)
+    env = {**os.environ, **server_env}
+    app_exe = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Ollama", "ollama app.exe")
+    if os.path.exists(app_exe):
+        subprocess.Popen([app_exe], env=env, creationflags=subprocess.CREATE_NO_WINDOW)
+    else:
+        import shutil
+        exe = shutil.which("ollama")
+        if not exe:
+            raise RuntimeError("Could not find Ollama to restart it.")
+        subprocess.Popen([exe, "serve"], env=env, creationflags=subprocess.CREATE_NO_WINDOW)
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        try:
+            if requests.get(f"{_ollama_host()}/api/tags", timeout=2).ok:
+                return
+        except Exception:
+            pass
+        time.sleep(2)
+    raise RuntimeError("Ollama did not come back within 90 seconds.")
+
+
+@app.route("/api/pipeline/run", methods=["POST"])
+def api_pipeline_run():
+    if not _request_allowed():
+        abort(403)
+    payload = request.get_json() or {}
+    values = payload.get("values") or {}
+    options = payload.get("options") or {}
+    try:
+        env, server_env = _pipeline_env(values)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    args = []
+    folder = str(options.get("folder") or "").strip()
+    if folder:
+        if not os.path.isdir(folder):
+            return jsonify({"error": f"Folder not found: {folder}"}), 400
+        args += ["--in-place", folder]
+    if options.get("retry_failed"):
+        args.append("--retry-failed")
+    if any(any(c in _CMD_METACHARS for c in a) for a in args):
+        return jsonify({"error": "The folder path may not contain & | < > ^ % or line breaks."}), 400
+
+    with _jobs_lock:
+        busy = [t for t in _INGEST_TASKS if t in _jobs and _jobs[t]["exit_code"] is None]
+    if busy:
+        return jsonify({"error": f"An ingest is already running ({busy[0]}); stop it first."}), 409
+
+    total, _names = _scan_documents(_inputs_root(folder))
+    if total == 0:
+        return jsonify({"error": "No documents found to ingest."}), 400
+
+    if options.get("restart_ollama"):
+        try:
+            _restart_ollama(server_env)
+        except Exception as e:
+            return jsonify({"error": f"Could not restart Ollama: {e}"}), 500
+
+    _save_pipeline_settings(values, {k: options.get(k) for k in ("folder", "retry_failed", "restart_ollama")})
+    progress = {"total": total, "done": 0, "failed": 0, "skipped": 0, "current": None, "unit": None,
+                "started": time.time(), "partial": ""}
+    return _start_job("pipeline_ui", PIPELINE_TASK, args, env_extra=env, progress=progress)
+
+
+@app.route("/api/pipeline/stop", methods=["POST"])
+def api_pipeline_stop():
+    if not _request_allowed():
+        abort(403)
+    with _jobs_lock:
+        job = _jobs.get("pipeline_ui")
+        running = bool(job) and job["exit_code"] is None
+        pid = job["proc"].pid if running else None
+    if not running:
+        return jsonify({"error": "The pipeline is not running."}), 400
+    subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True,
+                   creationflags=subprocess.CREATE_NO_WINDOW)
+    # The driver marks a document it finds "in progress" at the next start as failed (it assumes a crash).
+    # A deliberate stop isn't a crash, so clear that marker and the document is retried next time.
+    try:
+        with open(PIPELINE_RESILIENT_STATE, encoding="utf-8") as fp:
+            state = json.load(fp)
+        if state.get("in_progress"):
+            state["in_progress"] = None
+            with open(PIPELINE_RESILIENT_STATE, "w", encoding="utf-8") as fp:
+                json.dump(state, fp, indent=2)
+    except (OSError, ValueError):
+        pass
     return jsonify({"stopped": True})
 
 

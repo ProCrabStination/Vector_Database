@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import re
+import filecmp
 import hashlib
 import logging
 import pandas as pd
@@ -43,7 +44,7 @@ from Vector_Database_Ollama import (
     parse_chunk_name,
     processed_chunk_indices,
 )
-from LLM_Summary_Ollama import summarize_text, ask_vision_model
+from LLM_Summary_Ollama import summarize_text, ask_vision_model, print_ollama_ps
 
 
 # Configure logging
@@ -60,8 +61,7 @@ OLLAMA_APP = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Ollam
 PDF_PAGES_PER_CHUNK = 10
 DESCRIBE_PICTURES = os.getenv("PIPELINE_DESCRIBE_PICTURES", "1").strip().lower() not in ("0", "false", "no", "off")
 IMAGE_FILE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif', '.webp'}
-PICTURE_MIN_PIXELS = 80  # skip crops smaller than this in either direction (bullets, rules, icons)
-CLEAN_PDF_DEEP = False  # True also runs unpaper cleanup (needs unpaper on PATH)
+CLEAN_PDF_DEEP = os.getenv("PIPELINE_CLEAN_PDF_DEEP", "0").strip().lower() in ("1", "true", "yes", "on")  # also runs unpaper cleanup (needs unpaper on PATH)
 
 
 def split_pdf_into_page_chunks(pdf_path: Path, chunk_output_dir: Path, pages_per_chunk: int = PDF_PAGES_PER_CHUNK) -> List[Path]:
@@ -105,9 +105,10 @@ TABLE_PLACEHOLDER_RE = re.compile(r"\[\[TABLE_PLACEHOLDER:[^\]]*\]\]")
 
 
 def describe_picture(image_path, cache: dict) -> Optional[str]:
-    """Short vision-model description of one picture crop (None if missing, decorative or unreadable).
+    """Short vision-model description of one picture crop (None if the file is missing or the model fails).
 
-    Cached per image path, since the chunker can attach the same picture to several nearby chunks.
+    Every picture is described, however small. Cached per image path, since the chunker can attach the
+    same picture to several nearby chunks.
     """
     key = str(image_path)
     if key in cache:
@@ -115,19 +116,14 @@ def describe_picture(image_path, cache: dict) -> Optional[str]:
     description = None
     try:
         if Path(image_path).is_file():
-            from PIL import Image
-            with Image.open(image_path) as im:
-                big_enough = min(im.size) >= PICTURE_MIN_PIXELS
-            if big_enough:
-                text, model = ask_vision_model(
-                    image_path,
-                    "Describe this image briefly and in general terms: what kind of image it is (photo, diagram, "
-                    "schematic, chart, drawing, screenshot, ...) and what it shows. Mention any legible title or "
-                    "key labels. Do not invent details. If it is purely decorative (a logo, icon, rule, border "
-                    "or blank), reply with just: DECORATIVE.",
-                )
-                if text and text.strip().upper().rstrip(".") != "DECORATIVE":
-                    description = text.strip()
+            text, model = ask_vision_model(
+                image_path,
+                "Describe this image briefly and in general terms: what kind of image it is (photo, diagram, "
+                "schematic, chart, drawing, screenshot, logo, icon, ...) and what it shows. Mention any legible "
+                "title or key labels. Do not invent details.",
+            )
+            if text and text.strip():
+                description = text.strip()
     except Exception as e:
         logging.warning(f"Could not describe picture {image_path}: {e}")
     cache[key] = description
@@ -262,6 +258,25 @@ def copy_picture_to_completed(src, completed_dir: Path, chunk_label: Optional[st
     return str(dest)
 
 
+def archive_input_file(file_path: Path, completed_dir: Path, completed_doc: Path):
+    """Take a fully ingested document out of the Inputs folder.
+
+    The completed folder already holds a copy (the cleaned PDF when cleaning ran). If that copy is
+    byte-identical the input is simply removed; otherwise the original is moved to <completed_dir>/original/.
+    """
+    try:
+        if completed_doc.is_file() and filecmp.cmp(file_path, completed_doc, shallow=False):
+            file_path.unlink()
+            logging.info(f"Removed {file_path.name} from Inputs (identical copy is in {completed_dir}).")
+        else:
+            dest = completed_dir / "original" / file_path.name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(file_path), str(dest))
+            logging.info(f"Moved {file_path.name} out of Inputs to {dest}.")
+    except Exception as e:
+        logging.warning(f"Could not move {file_path} out of Inputs: {e}")
+
+
 def process_single_document(file_path: Path, output_root: Path, input_root: Path, reference_in_place: bool = False):
     """Ingest one document.
 
@@ -279,8 +294,12 @@ def process_single_document(file_path: Path, output_root: Path, input_root: Path
     # Determine output subdirectory maintaining structure relative to input_root
     try:
         relative_path = file_path.relative_to(input_root).parent
+        in_inputs = True
     except ValueError:
         relative_path = Path(".")
+        in_inputs = False
+    # Finished documents leave Inputs. Never when referencing a user's folder in place: those originals are what the DB points at.
+    archive_when_done = in_inputs and not reference_in_place
     output_subdir = output_root / relative_path
 
     # Completed layout: <Completed Documents For Reference>/<doc>/<doc>.<ext> plus <doc>/images/.
@@ -300,6 +319,8 @@ def process_single_document(file_path: Path, output_root: Path, input_root: Path
     if file_path.suffix.lower() == ".pdf":
         if pdf_fully_processed(file_path, completed_doc):
             print(f"Skipping {file_path}: all 10-page PDF units are already processed.")
+            if archive_when_done:
+                archive_input_file(file_path, completed_dir, completed_doc)
             return
 
         source_path = clean_pdf_step(file_path, output_subdir / "_cleaned" / file_path.name)
@@ -326,6 +347,8 @@ def process_single_document(file_path: Path, output_root: Path, input_root: Path
 
         if not files_to_process:
             print(f"Skipping {file_path}: all 10-page PDF units are already processed.")
+            if archive_when_done:
+                archive_input_file(file_path, completed_dir, completed_doc)
             return
 
     # Keep the full original document with its images in the completed-documents folder
@@ -335,6 +358,7 @@ def process_single_document(file_path: Path, output_root: Path, input_root: Path
             shutil.copy2(source_path, completed_doc)
 
     prev_unit_tail = None  # (final text of the previous unit's last chunk, its end page), for table context
+    failed_units = 0  # units that were not ingested; the document stays in Inputs if any
     for file_unit in files_to_process:
         logging.info(f"\nProcessing file: {file_unit}")
         chunk_info = parse_chunk_name(file_unit.stem)  # (source, "pages_0001-0010", start, end) or None
@@ -346,10 +370,12 @@ def process_single_document(file_path: Path, output_root: Path, input_root: Path
             converted = process_file(file_unit, output_subdir)
         except Exception as e:
             logging.error(f"Error converting file {file_unit}: {e}")
+            failed_units += 1
             continue
 
         if converted is None:
             logging.error(f"Error: Document conversion failed: {file_unit.name}")
+            failed_units += 1
             continue
 
         doc = converted.document
@@ -398,11 +424,6 @@ def process_single_document(file_path: Path, output_root: Path, input_root: Path
                 )
             if not chunks:
                 print(f"Skipping {doc_full_path}: all sections are already processed.")
-                continue
-
-            MAX_CHUNKS = 1000
-            if len(chunks) > MAX_CHUNKS:
-                logging.warning(f"Skipping {file_unit} because it has {len(chunks)} chunks (>{MAX_CHUNKS})")
                 continue
 
             tokenizer = EmbeddingTokenizer()
@@ -740,12 +761,6 @@ def process_single_document(file_path: Path, output_root: Path, input_root: Path
                         token_count = count_embedding_tokens(vectorize_text)
                         print(f"    Added {len(new_descriptions)} image description(s); payload now {token_count} tokens")
 
-                # Skip chunks that are effectively empty (a stray digit or mark from OCR): they only add noise
-                # to search results. Tables and pictures count as content.
-                if not has_table and not pictures and len(re.sub(r"\W", "", vectorize_text)) < 4:
-                    print(f"  Skipping chunk {chunk_index}: no meaningful content ({vectorize_text.strip()!r})")
-                    continue
-
                 # Prepare metadata for database
                 metadata = {
                         "chunk_index": chunk_index,
@@ -777,7 +792,7 @@ def process_single_document(file_path: Path, output_root: Path, input_root: Path
             # After chunks_to_vectorize prepared
             print(f"Total chunks prepared for vectorization: {len(chunks_to_vectorize)}")
 
-            BATCH_SIZE = 20
+            BATCH_SIZE = max(1, int(os.getenv("PIPELINE_EMBED_BATCH_SIZE", "20")))
             total_vectors_added = 0
 
             def print_failed_chunk(item, error):
@@ -853,10 +868,17 @@ def process_single_document(file_path: Path, output_root: Path, input_root: Path
                             ) from individual_error
 
             print(f"\n✓ Document complete: {total_vectors_added} vectors added to database")
+            # Summary and embedding steps are done; show what Ollama has loaded before the next conversion unloads it.
+            print_ollama_ps(f"after {file_unit.name}")
 
         except Exception as e:
             raise RuntimeError(f"Error processing document chunks for {file_unit}: {e}") from e
-    
+
+    if archive_when_done and failed_units == 0:
+        archive_input_file(file_path, completed_dir, completed_doc)
+    elif failed_units:
+        logging.warning(f"{file_path.name}: {failed_units} unit(s) failed; leaving it in Inputs.")
+
 
 
 def can_write_db():
@@ -876,6 +898,10 @@ def can_write_db():
 
                 
 def main():
+    # Run directly (not under Run_Pipeline_Resilient.py, which already logs and monitors): log here.
+    if not os.environ.get("PIPELINE_LOGGING_ACTIVE"):
+        import Pipeline_Logging
+        Pipeline_Logging.start("pipeline")
     args = sys.argv
 
     # Set up paths
@@ -914,7 +940,7 @@ def main():
         
         processed_count = 0
         
-        for file_path in input_root.rglob('*'):
+        for file_path in list(input_root.rglob('*')):  # snapshot: finished files are moved out of Inputs as we go
             if (
                 file_path.is_file()
                 and not file_path.name.startswith('~$')

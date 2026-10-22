@@ -139,6 +139,38 @@
     padding: 0.6rem; font: 0.75rem/1.4 Consolas, monospace; white-space: pre-wrap; word-break: break-all;
     max-height: 18rem; overflow-y: auto;
   }
+  .pipeline-view { display: none; }
+  .pl-progress {
+    position: sticky; top: 0; z-index: 5; background: var(--bg); border-bottom: 1px solid var(--border);
+    padding: 0.8rem 1.5rem;
+  }
+  .pl-progress-top { display: flex; gap: 1.2rem; align-items: baseline; flex-wrap: wrap; }
+  .pl-progress-top strong { font-size: 1rem; }
+  .pl-progress-top span { color: var(--muted); font-size: 0.82rem; }
+  .pl-bar { height: 14px; background: #0b1220; border: 1px solid var(--border); border-radius: 7px; overflow: hidden; margin-top: 0.5rem; }
+  .pl-bar-fill { height: 100%; width: 0; background: var(--accent); transition: width 0.4s; }
+  .pl-bar-fill.ok { background: var(--score); }
+  .pl-bar-fill.fail { background: #f87171; }
+  .pl-current { color: var(--muted); font-size: 0.8rem; margin-top: 0.45rem; min-height: 1.1rem; word-break: break-all; }
+  .pl-docs { margin-top: 0.3rem; font-size: 0.78rem; color: var(--muted); }
+  .pl-docs summary { cursor: pointer; }
+  .pl-docs ul { margin: 0.4rem 0 0; padding-left: 1.2rem; max-height: 10rem; overflow-y: auto; }
+  .pl-layout { display: flex; gap: 1.5rem; padding: 1.5rem; align-items: flex-start; }
+  .pl-settings { width: 400px; flex-shrink: 0; max-height: calc(100vh - 8rem); overflow-y: auto; position: sticky; top: 6.5rem; }
+  .pl-main { flex: 1; min-width: 0; }
+  .pl-group { border-top: 1px solid var(--border); padding: 0.3rem 0; }
+  .pl-group:first-of-type { border-top: none; }
+  .pl-group summary { cursor: pointer; font-weight: 600; font-size: 0.9rem; padding: 0.4rem 0; }
+  .pl-note { color: #fbbf24; font-size: 0.75rem; margin: 0.2rem 0 0.4rem; }
+  .pl-help { color: var(--muted); font-size: 0.72rem; margin-top: 0.2rem; line-height: 1.35; }
+  .pl-console {
+    margin: 0.8rem 0 0; background: #020617; border: 1px solid var(--border); border-radius: 8px; padding: 0.7rem;
+    font: 0.78rem/1.4 Consolas, monospace; white-space: pre-wrap; word-break: break-all;
+    height: calc(100vh - 14rem); min-height: 360px; overflow-y: auto;
+  }
+  .pl-controls { display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; }
+  .pl-controls .checkbox-row { margin-top: 0; }
+  @media (max-width: 900px) { .pl-layout { flex-direction: column; } .pl-settings { width: 100%; position: static; max-height: none; } }
 </style>
 </head>
 <body>
@@ -147,9 +179,48 @@
   <span class="store">{{ store_dir }}</span>
   <nav class="tabs">
     <button type="button" id="tabSearch" class="active">Search</button>
+    <button type="button" id="tabPipeline">Pipeline</button>
     <button type="button" id="tabTasks">Run Tasks</button>
   </nav>
 </header>
+
+<div class="pipeline-view" id="pipelineView">
+  <div class="pl-progress">
+    <div class="pl-progress-top">
+      <strong id="plCount">0 / 0 documents</strong>
+      <span id="plPct"></span>
+      <span id="plBreakdown"></span>
+      <span id="plElapsed"></span>
+    </div>
+    <div class="pl-bar"><div class="pl-bar-fill" id="plFill"></div></div>
+    <div class="pl-current" id="plCurrent"></div>
+    <details class="pl-docs"><summary id="plDocsSummary">Documents detected</summary><ul id="plDocs"></ul></details>
+  </div>
+  <div class="pl-layout">
+    <div class="panel pl-settings" id="plSettings">
+      <details class="pl-group" open>
+        <summary>Source</summary>
+        <label for="plFolder">Folder to scan in place (blank = Documents\Inputs)</label>
+        <input type="text" id="plFolder" placeholder="e.g. D:\Shared\Manuals">
+        <div class="pl-help">In-place mode references the originals and never moves them.</div>
+        <div class="checkbox-row"><input type="checkbox" id="plRetry"><label for="plRetry">Retry documents that failed before</label></div>
+      </details>
+      <div id="plGroups"></div>
+      <button type="button" class="btn-tertiary" id="plReset" style="margin-top:1rem">Reset settings to defaults</button>
+    </div>
+    <div class="pl-main">
+      <div class="pl-controls task-actions" style="margin-top:0">
+        <button type="button" id="plStart">Start pipeline</button>
+        <button type="button" class="btn-stop" id="plStop" style="display:none">Stop</button>
+        <button type="button" class="btn-tertiary" id="plClear">Clear console</button>
+        <div class="checkbox-row"><input type="checkbox" id="plAuto" checked><label for="plAuto">Auto-scroll</label></div>
+      </div>
+      <div class="task-status" id="plStatus"></div>
+      <pre class="pl-console" id="plConsole">Console output appears here once the pipeline starts.</pre>
+    </div>
+  </div>
+  <datalist id="plModels"></datalist>
+</div>
 
 <div class="tasks-view" id="tasksView">
   <div class="task-grid" id="taskGrid"></div>
@@ -466,15 +537,20 @@ $("clearDocFilter").addEventListener("click", () => {
 // ---- Run Tasks tab -------------------------------------------------------
 const taskState = {};  // task id -> { offset, text, timer }
 
+let currentTab = "search";
 function showTab(name) {
-  const tasks = name === "tasks";
-  $("tasksView").style.display = tasks ? "block" : "none";
-  $("searchView").style.display = tasks ? "none" : "flex";
-  $("tabTasks").classList.toggle("active", tasks);
-  $("tabSearch").classList.toggle("active", !tasks);
-  if (tasks && !$("taskGrid").children.length) loadTasks();
+  currentTab = name;
+  $("tasksView").style.display = name === "tasks" ? "block" : "none";
+  $("pipelineView").style.display = name === "pipeline" ? "block" : "none";
+  $("searchView").style.display = name === "search" ? "flex" : "none";
+  $("tabTasks").classList.toggle("active", name === "tasks");
+  $("tabPipeline").classList.toggle("active", name === "pipeline");
+  $("tabSearch").classList.toggle("active", name === "search");
+  if (name === "tasks" && !$("taskGrid").children.length) loadTasks();
+  if (name === "pipeline") pipelineShown();
 }
 $("tabSearch").addEventListener("click", () => showTab("search"));
+$("tabPipeline").addEventListener("click", () => showTab("pipeline"));
 $("tabTasks").addEventListener("click", () => showTab("tasks"));
 
 function collapseCarriageReturns(text) {
@@ -665,6 +741,208 @@ async function pollTask(id, fresh) {
   setTaskUi(id, data);
   if (data.running) st.timer = setTimeout(() => pollTask(id), 1000);
 }
+
+// ---- Pipeline tab --------------------------------------------------------
+const pl = { schema: [], loaded: false, offset: 0, text: "", timer: null, running: false, inputs: 0, progress: null };
+
+function fmtElapsed(sec) {
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  return (h ? h + ":" + String(m).padStart(2, "0") : m) + ":" + String(s).padStart(2, "0");
+}
+
+function plItems() { return pl.schema.flatMap(g => g.items); }
+
+function buildSettings() {
+  $("plGroups").innerHTML = pl.schema.map(g => {
+    const items = g.items.map(it => {
+      const id = "pl-" + it.env;
+      let input;
+      if (it.type === "bool") {
+        input = `<div class="checkbox-row"><input type="checkbox" id="${id}"><label for="${id}">${escapeHtml(it.label)}</label></div>`;
+      } else {
+        let field;
+        if (it.type === "select") {
+          field = `<select id="${id}">` + it.choices.map((c, i) =>
+            `<option value="${escapeHtml(c)}">${escapeHtml((it.choice_labels || it.choices)[i])}</option>`).join("") + `</select>`;
+        } else if (it.type === "number") {
+          field = `<input type="number" id="${id}" min="${it.min}" max="${it.max}" step="${it.step || (it.int ? 1 : "any")}" placeholder="${escapeHtml(it.default)}">`;
+        } else {
+          field = `<input type="text" id="${id}" ${it.models ? 'list="plModels"' : ""} placeholder="${escapeHtml(it.default)}">`;
+        }
+        input = `<label for="${id}">${escapeHtml(it.label)}</label>${field}`;
+      }
+      return input + (it.help ? `<div class="pl-help">${escapeHtml(it.help)}</div>` : "");
+    }).join("");
+    const extra = g.group === "Ollama server"
+      ? `<div class="checkbox-row"><input type="checkbox" id="plRestart"><label for="plRestart">Restart Ollama with these settings before starting</label></div>
+         <div class="pl-help">Stops Ollama (including anything else using it) and starts it again.</div>` : "";
+    return `<details class="pl-group" ${g.group === "Models" || g.group === "Memory and context" ? "open" : ""}>
+      <summary>${escapeHtml(g.group)}</summary>${g.note ? `<div class="pl-note">${escapeHtml(g.note)}</div>` : ""}${items}${extra}</details>`;
+  }).join("");
+}
+
+function setSettingValues(values) {
+  plItems().forEach(it => {
+    const el = $("pl-" + it.env);
+    const v = values && values[it.env] !== undefined ? values[it.env] : it.default;
+    if (it.type === "bool") el.checked = String(v) === "1";
+    else el.value = v;
+  });
+}
+
+function collectSettings() {
+  const values = {};
+  plItems().forEach(it => {
+    const el = $("pl-" + it.env);
+    values[it.env] = it.type === "bool" ? (el.checked ? "1" : "0") : el.value.trim();
+  });
+  return values;
+}
+
+async function loadPipeline() {
+  const data = await (await fetch("/api/pipeline/config")).json();
+  pl.schema = data.schema;
+  buildSettings();
+  const saved = data.saved || {};
+  setSettingValues(saved.values);
+  const opts = saved.options || {};
+  $("plFolder").value = opts.folder || "";
+  $("plRetry").checked = !!opts.retry_failed;
+  if ($("plRestart")) $("plRestart").checked = !!opts.restart_ollama;
+  $("plModels").innerHTML = (data.models || []).map(m => `<option value="${escapeHtml(m)}">`).join("");
+  pl.loaded = true;
+  showInputs(data.inputs);
+  if (data.state && data.state.job_id) {
+    pl.offset = 0; pl.text = "";
+    pollPipeline();
+  } else {
+    renderProgress(data.state || {});
+  }
+}
+
+function showInputs(inputs) {
+  pl.inputs = inputs.count;
+  $("plDocsSummary").textContent = `${inputs.count} document${inputs.count === 1 ? "" : "s"} detected in ${inputs.root}`;
+  $("plDocs").innerHTML = inputs.names.map(n => `<li>${escapeHtml(n)}</li>`).join("") +
+    (inputs.count > inputs.names.length ? `<li>…and ${inputs.count - inputs.names.length} more</li>` : "");
+  if (!pl.running && !pl.progress) renderProgress({});
+}
+
+function renderProgress(state) {
+  const p = state.progress;
+  pl.progress = p || null;
+  const fill = $("plFill");
+  fill.className = "pl-bar-fill";
+  if (!p) {
+    $("plCount").textContent = `${pl.inputs} document${pl.inputs === 1 ? "" : "s"} ready`;
+    $("plPct").textContent = ""; $("plBreakdown").textContent = ""; $("plElapsed").textContent = "";
+    $("plCurrent").textContent = pl.inputs ? "Idle. Adjust the settings and press Start." : "No documents detected.";
+    fill.style.width = "0%";
+    return;
+  }
+  const finished = p.done + p.failed + p.skipped;
+  const pct = p.total ? Math.min(100, Math.floor(finished / p.total * 100)) : 0;
+  fill.style.width = pct + "%";
+  $("plCount").textContent = `${finished} / ${p.total} documents`;
+  $("plPct").textContent = pct + "%";
+  $("plBreakdown").textContent = `${p.done} done · ${p.failed} failed · ${p.skipped} skipped earlier`;
+  $("plElapsed").textContent = "elapsed " + fmtElapsed(p.elapsed);
+  if (state.running) {
+    $("plCurrent").textContent = p.current ? `Now: ${p.current}${p.unit ? "  —  " + p.unit : ""}` : "Starting…";
+  } else {
+    const ok = state.exit_code === 0;
+    fill.classList.add(ok && !p.failed ? "ok" : "fail");
+    $("plCurrent").textContent = ok ? "Finished." : `Stopped or failed (exit code ${state.exit_code}).`;
+  }
+}
+
+function setPipelineUi(state) {
+  pl.running = !!state.running;
+  $("plStart").disabled = pl.running;
+  $("plStop").style.display = pl.running ? "inline-block" : "none";
+  const status = $("plStatus");
+  status.className = "task-status " + (pl.running ? "running" : state.exit_code === 0 ? "ok" : state.exit_code == null ? "" : "fail");
+  status.textContent = !state.job_id ? "" :
+    pl.running ? `Running: ${state.command}` : `Finished with exit code ${state.exit_code}: ${state.command}`;
+  renderProgress(state);
+}
+
+async function pollPipeline() {
+  clearTimeout(pl.timer);
+  let data;
+  try {
+    data = await (await fetch(`/api/tasks/pipeline_ui/output?offset=${pl.offset}`)).json();
+  } catch (err) {
+    pl.timer = setTimeout(pollPipeline, 2000);
+    return;
+  }
+  const out = $("plConsole");
+  if (data.output) {
+    pl.text = collapseCarriageReturns(pl.text + data.output);
+    if (pl.text.length > 600000) pl.text = pl.text.slice(-500000);  // keep the browser responsive on long runs
+    pl.offset = data.next_offset;
+    out.textContent = pl.text;
+    if ($("plAuto").checked) out.scrollTop = out.scrollHeight;
+  }
+  setPipelineUi(data);
+  if (data.running) pl.timer = setTimeout(pollPipeline, 1000);
+  else refreshInputs();
+}
+
+async function refreshInputs() {
+  if (pl.running) return;
+  const folder = $("plFolder").value.trim();
+  try {
+    const resp = await fetch("/api/pipeline/inputs" + (folder ? "?folder=" + encodeURIComponent(folder) : ""));
+    if (resp.ok) showInputs(await resp.json());
+  } catch (err) { /* offline: keep what is shown */ }
+}
+
+function pipelineShown() {
+  if (!pl.loaded) loadPipeline(); else refreshInputs();
+}
+setInterval(() => { if (currentTab === "pipeline" && pl.loaded && !pl.running) refreshInputs(); }, 5000);
+$("plFolder").addEventListener("change", () => { pl.progress = null; refreshInputs(); });
+
+$("plStart").addEventListener("click", async () => {
+  const restart = $("plRestart") && $("plRestart").checked;
+  const status = $("plStatus");
+  $("plStart").disabled = true;
+  status.className = "task-status running";
+  status.textContent = restart ? "Restarting Ollama, then starting…" : "Starting…";
+  let resp;
+  try {
+    resp = await fetch("/api/pipeline/run", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        values: collectSettings(),
+        options: { folder: $("plFolder").value.trim(), retry_failed: $("plRetry").checked, restart_ollama: restart },
+      }),
+    });
+  } catch (err) {
+    status.className = "task-status fail";
+    status.textContent = "Request failed: " + err;
+    $("plStart").disabled = false;
+    return;
+  }
+  if (!resp.ok) {
+    let msg = resp.statusText;
+    try { msg = (await resp.json()).error || msg; } catch (e) {}
+    status.className = "task-status fail";
+    status.textContent = "Error: " + msg;
+    $("plStart").disabled = false;
+    return;
+  }
+  pl.offset = 0; pl.text = ""; pl.progress = null;
+  $("plConsole").textContent = "";
+  pollPipeline();
+});
+
+$("plStop").addEventListener("click", async () => {
+  await fetch("/api/pipeline/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+});
+$("plClear").addEventListener("click", () => { pl.text = ""; $("plConsole").textContent = ""; });
+$("plReset").addEventListener("click", () => setSettingValues({}));
 
 loadDocumentList();
 $("query").addEventListener("keydown", (e) => {
